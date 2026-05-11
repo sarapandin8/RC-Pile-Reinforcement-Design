@@ -801,22 +801,236 @@ def interaction_plot_with_demand(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: 
     return fig
 
 
-def pmm_slice_points(mnx_kNm: float, mny_kNm: float, alpha: float, point_count: int = 181) -> pd.DataFrame:
-    if mnx_kNm <= 0.0 or mny_kNm <= 0.0:
-        return pd.DataFrame(columns=["mx_kNm", "my_kNm"])
+def concrete_fibers(
+    geometry: SectionGeometry,
+    shape: Shape,
+    target_fiber_size_mm: float = 25.0,
+) -> list[tuple[float, float, float]]:
+    fibers: list[tuple[float, float, float]] = []
+    if shape == "Circular":
+        diameter = float(geometry.diameter_mm)
+        radius = diameter / 2.0
+        divisions = max(24, min(60, int(math.ceil(diameter / target_fiber_size_mm))))
+        step = diameter / divisions
+        start = -radius + 0.5 * step
+        for i in range(divisions):
+            x = start + i * step
+            for j in range(divisions):
+                y = start + j * step
+                if x * x + y * y <= radius * radius:
+                    fibers.append((x, y, step * step))
+        return fibers
+
+    width = float(geometry.width_mm)
+    depth = float(geometry.depth_mm)
+    nx = max(20, min(60, int(math.ceil(width / target_fiber_size_mm))))
+    ny = max(20, min(60, int(math.ceil(depth / target_fiber_size_mm))))
+    dx = width / nx
+    dy = depth / ny
+    x0 = -width / 2.0 + 0.5 * dx
+    y0 = -depth / 2.0 + 0.5 * dy
+    for i in range(nx):
+        x = x0 + i * dx
+        for j in range(ny):
+            y = y0 + j * dy
+            fibers.append((x, y, dx * dy))
+    return fibers
+
+
+def section_support_coordinate(geometry: SectionGeometry, shape: Shape, theta_rad: float) -> float:
+    if shape == "Circular":
+        return float(geometry.diameter_mm) / 2.0
+    width = float(geometry.width_mm)
+    depth = float(geometry.depth_mm)
+    return 0.5 * width * abs(math.cos(theta_rad)) + 0.5 * depth * abs(math.sin(theta_rad))
+
+
+def rotated_section_response(
+    geometry: SectionGeometry,
+    shape: Shape,
+    theta_rad: float,
+    neutral_axis_mm: float,
+    fc_mpa: float,
+    fy_mpa: float,
+    phi: float,
+    axial_cap_factor_value: float,
+    fibers: list[tuple[float, float, float]],
+    bar_coords: list[tuple[float, float]],
+    bar_area_single_mm2: float,
+) -> dict[str, float]:
+    eps_cu = 0.003
+    beta1 = beta1_aci(fc_mpa)
+    support = section_support_coordinate(geometry, shape, theta_rad)
+    a_depth = min(beta1 * neutral_axis_mm, 2.0 * support)
+    threshold = support - a_depth
+    cos_t = math.cos(theta_rad)
+    sin_t = math.sin(theta_rad)
+
+    concrete_force_n = 0.0
+    mx_nmm = 0.0
+    my_nmm = 0.0
+    for x, y, area in fibers:
+        u = x * cos_t + y * sin_t
+        if u >= threshold:
+            force = 0.85 * fc_mpa * area
+            concrete_force_n += force
+            mx_nmm += force * y
+            my_nmm += force * x
+
+    steel_force_n = 0.0
+    max_tension_strain = 0.0
+    for x, y in bar_coords:
+        u = x * cos_t + y * sin_t
+        dist_from_face = support - u
+        strain = eps_cu * (1.0 - dist_from_face / neutral_axis_mm)
+        max_tension_strain = max(max_tension_strain, -strain)
+        stress = steel_stress_mpa(strain, fy_mpa)
+        in_compression_block = u >= threshold
+        force = bar_area_single_mm2 * (stress - 0.85 * fc_mpa) if in_compression_block else bar_area_single_mm2 * stress
+        steel_force_n += force
+        mx_nmm += force * y
+        my_nmm += force * x
+
+    nominal_p_n = concrete_force_n + steel_force_n
+    phi_pn_kN = phi * nominal_p_n / 1000.0
+    phi_pn_max_kN = design_strength_kN(
+        phi=phi,
+        fc_mpa=fc_mpa,
+        fy_mpa=fy_mpa,
+        ag_mm2=geometry.ag_mm2,
+        ast_mm2=len(bar_coords) * bar_area_single_mm2,
+        axial_cap_factor_value=axial_cap_factor_value,
+    )
+    return {
+        "phi_pn_kN": min(phi_pn_kN, phi_pn_max_kN),
+        "phi_mx_kNm": phi * mx_nmm / 1_000_000.0,
+        "phi_my_kNm": phi * my_nmm / 1_000_000.0,
+        "max_tension_strain": max_tension_strain,
+    }
+
+
+def pmm_sample_fractions() -> list[float]:
+    return [0.02, 0.05, 0.08, 0.12, 0.16, 0.22, 0.30, 0.40, 0.55, 0.75, 1.0, 1.35, 1.8, 2.4, 3.2, 4.5, 6.0]
+
+
+def rotated_pmm_responses(
+    geometry: SectionGeometry,
+    shape: Shape,
+    cover_mm: float,
+    tie_dia_mm: float,
+    bar_dia_mm: float,
+    fc_mpa: float,
+    fy_mpa: float,
+    phi: float,
+    axial_cap_factor_value: float,
+    bars_width_face: int | None = None,
+    bars_depth_face: int | None = None,
+    bars_circular: int | None = None,
+    angle_count: int = 49,
+) -> list[dict]:
+    fibers = concrete_fibers(geometry, shape)
+    bar_coords = section_bar_coordinates(
+        geometry=geometry,
+        shape=shape,
+        cover_mm=cover_mm,
+        tie_dia_mm=tie_dia_mm,
+        bar_dia_mm=bar_dia_mm,
+        bars_width_face=bars_width_face,
+        bars_depth_face=bars_depth_face,
+        bars_circular=bars_circular,
+    )
+    bar_area_single = bar_area_mm2(bar_dia_mm)
+    responses: list[dict] = []
+    for angle_index in range(angle_count):
+        theta = 2.0 * math.pi * angle_index / angle_count
+        support = section_support_coordinate(geometry, shape, theta)
+        for fraction in pmm_sample_fractions():
+            c_value = max(1.0, 2.0 * support * fraction)
+            response = rotated_section_response(
+                geometry=geometry,
+                shape=shape,
+                theta_rad=theta,
+                neutral_axis_mm=c_value,
+                fc_mpa=fc_mpa,
+                fy_mpa=fy_mpa,
+                phi=phi,
+                axial_cap_factor_value=axial_cap_factor_value,
+                fibers=fibers,
+                bar_coords=bar_coords,
+                bar_area_single_mm2=bar_area_single,
+            )
+            responses.append(
+                {
+                    "theta_rad": theta,
+                    "c_mm": c_value,
+                    "phi_pn_kN": response["phi_pn_kN"],
+                    "phi_mx_kNm": response["phi_mx_kNm"],
+                    "phi_my_kNm": response["phi_my_kNm"],
+                }
+            )
+    return responses
+
+
+def pmm_slice_from_responses(responses: list[dict], pu_kN: float) -> pd.DataFrame:
+    if not responses:
+        return pd.DataFrame(columns=["mx_kNm", "my_kNm", "theta_rad"])
     rows: list[dict[str, float]] = []
-    for i in range(point_count):
-        theta = 2.0 * math.pi * i / (point_count - 1)
-        c = math.cos(theta)
-        s = math.sin(theta)
-        denominator = (abs(c) / mnx_kNm) ** alpha + (abs(s) / mny_kNm) ** alpha
-        radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
-        rows.append({"mx_kNm": radius * c, "my_kNm": radius * s})
+    theta_values = sorted({item["theta_rad"] for item in responses})
+    for theta in theta_values:
+        series = [item for item in responses if abs(item["theta_rad"] - theta) < 1e-9]
+        series = sorted(series, key=lambda item: item["phi_pn_kN"], reverse=True)
+        found = False
+        for first, second in zip(series, series[1:]):
+            p1 = first["phi_pn_kN"]
+            p2 = second["phi_pn_kN"]
+            if (p1 >= pu_kN >= p2) or (p2 >= pu_kN >= p1):
+                ratio = 0.0 if abs(p2 - p1) < 1e-9 else (pu_kN - p1) / (p2 - p1)
+                rows.append(
+                    {
+                        "theta_rad": theta,
+                        "mx_kNm": first["phi_mx_kNm"] + ratio * (second["phi_mx_kNm"] - first["phi_mx_kNm"]),
+                        "my_kNm": first["phi_my_kNm"] + ratio * (second["phi_my_kNm"] - first["phi_my_kNm"]),
+                    }
+                )
+                found = True
+                break
+        if not found:
+            above = [item for item in series if item["phi_pn_kN"] >= pu_kN]
+            if above:
+                best = max(above, key=lambda item: math.hypot(item["phi_mx_kNm"], item["phi_my_kNm"]))
+                rows.append({"theta_rad": theta, "mx_kNm": best["phi_mx_kNm"], "my_kNm": best["phi_my_kNm"]})
+    if not rows:
+        return pd.DataFrame(columns=["mx_kNm", "my_kNm", "theta_rad"])
+    rows.append(rows[0].copy())
     return pd.DataFrame(rows)
 
 
-def pmm_slice_plot(mnx_kNm: float, mny_kNm: float, pu_kN: float, mx_kNm: float, my_kNm: float, alpha: float, ratio: float) -> go.Figure:
-    contour = pmm_slice_points(mnx_kNm, mny_kNm, alpha)
+def ray_polygon_utilization(contour_df: pd.DataFrame, demand_mx_kNm: float, demand_my_kNm: float) -> float:
+    if contour_df.empty:
+        return float("inf")
+    if abs(demand_mx_kNm) < 1e-9 and abs(demand_my_kNm) < 1e-9:
+        return 0.0
+    direction = (demand_mx_kNm, demand_my_kNm)
+    best_t: float | None = None
+    points = list(zip(contour_df["mx_kNm"], contour_df["my_kNm"]))
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        sx = bx - ax
+        sy = by - ay
+        denominator = direction[0] * sy - direction[1] * sx
+        if abs(denominator) < 1e-9:
+            continue
+        t = (ax * sy - ay * sx) / denominator
+        u = (ax * direction[1] - ay * direction[0]) / denominator
+        if t >= 0.0 and 0.0 <= u <= 1.0:
+            if best_t is None or t < best_t:
+                best_t = t
+    if best_t is None or best_t <= 0.0:
+        return float("inf")
+    return 1.0 / best_t
+
+
+def pmm_slice_plot(contour_df: pd.DataFrame, pu_kN: float, mx_kNm: float, my_kNm: float, ratio: float) -> go.Figure:
+    contour = contour_df.copy()
     fig = go.Figure()
     if not contour.empty:
         fig.add_trace(
@@ -864,43 +1078,38 @@ def pmm_slice_plot(mnx_kNm: float, mny_kNm: float, pu_kN: float, mx_kNm: float, 
 
 
 def pmm_surface_plot(
-    curve_x: pd.DataFrame,
-    curve_y: pd.DataFrame,
+    responses: list[dict],
+    contour_df: pd.DataFrame,
     pu_kN: float,
     mx_kNm: float,
     my_kNm: float,
-    alpha: float,
     ratio: float,
 ) -> go.Figure:
-    p_max = max(0.0, min(float(curve_x["phi_pn_kN"].max()), float(curve_y["phi_pn_kN"].max())))
-    p_levels = [p_max * i / 24.0 for i in range(25)]
-    theta_values = [2.0 * math.pi * i / 48.0 for i in range(49)]
-
+    if not responses:
+        return go.Figure()
+    theta_values = sorted({item["theta_rad"] for item in responses})
+    c_values = sorted({item["c_mm"] for item in responses})
+    by_key = {(item["theta_rad"], item["c_mm"]): item for item in responses}
     x_grid: list[list[float]] = []
     y_grid: list[list[float]] = []
     z_grid: list[list[float]] = []
-
-    for p_level in p_levels:
-        mnx = moment_capacity_at_pu(curve_x, p_level)
-        mny = moment_capacity_at_pu(curve_y, p_level)
-        if mnx <= 0.0 or mny <= 0.0:
-            continue
+    for c_value in c_values:
         row_x: list[float] = []
         row_y: list[float] = []
         row_z: list[float] = []
         for theta in theta_values:
-            c = math.cos(theta)
-            s = math.sin(theta)
-            denominator = (abs(c) / mnx) ** alpha + (abs(s) / mny) ** alpha
-            radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
-            row_x.append(radius * c)
-            row_y.append(radius * s)
-            row_z.append(p_level)
-        x_grid.append(row_x)
-        y_grid.append(row_y)
-        z_grid.append(row_z)
+            item = by_key.get((theta, c_value))
+            if item is None:
+                continue
+            row_x.append(item["phi_mx_kNm"])
+            row_y.append(item["phi_my_kNm"])
+            row_z.append(item["phi_pn_kN"])
+        if row_x:
+            x_grid.append(row_x)
+            y_grid.append(row_y)
+            z_grid.append(row_z)
 
-    current_slice = pmm_slice_points(moment_capacity_at_pu(curve_x, pu_kN), moment_capacity_at_pu(curve_y, pu_kN), alpha)
+    current_slice = contour_df.copy()
     fig = go.Figure()
     fig.add_trace(
         go.Surface(
@@ -1204,23 +1413,36 @@ section_layout_fig = section_figure(
     bars_circular=int(bars_circular) if bars_circular is not None else None,
 )
 uniaxial_fig = interaction_plot_with_demand(curve_x_manual, curve_y_manual, governing_case["pu"], governing_case["mx"], governing_case["my"])
+pmm_responses_true = rotated_pmm_responses(
+    geometry=geometry,
+    shape=shape,
+    cover_mm=cover_mm,
+    tie_dia_mm=tie_dia_mm,
+    bar_dia_mm=float(manual_bar_dia_mm),
+    fc_mpa=fc_mpa,
+    fy_mpa=fy_mpa,
+    phi=phi,
+    axial_cap_factor_value=axial_cap,
+    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
+    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
+    bars_circular=int(bars_circular) if bars_circular is not None else None,
+)
+pmm_slice_true_df = pmm_slice_from_responses(pmm_responses_true, governing_case["pu"])
+pmm_true_ratio = ray_polygon_utilization(pmm_slice_true_df, governing_case["mx"], governing_case["my"])
 pmm_slice_fig = pmm_slice_plot(
-    mnx_kNm=manual_result.phi_mnx_at_pu_kNm,
-    mny_kNm=manual_result.phi_mny_at_pu_kNm,
+    contour_df=pmm_slice_true_df,
     pu_kN=governing_case["pu"],
     mx_kNm=governing_case["mx"],
     my_kNm=governing_case["my"],
-    alpha=biaxial_alpha,
-    ratio=manual_result.governing_ratio,
+    ratio=pmm_true_ratio,
 )
 pmm_surface_fig = pmm_surface_plot(
-    curve_x=curve_x_manual,
-    curve_y=curve_y_manual,
+    responses=pmm_responses_true,
+    contour_df=pmm_slice_true_df,
     pu_kN=governing_case["pu"],
     mx_kNm=governing_case["mx"],
     my_kNm=governing_case["my"],
-    alpha=biaxial_alpha,
-    ratio=manual_result.governing_ratio,
+    ratio=pmm_true_ratio,
 )
 
 result_cols = st.columns(6)
@@ -1390,7 +1612,7 @@ with tabs[3]:
         **Engineering note**
 
         - This app is now much closer in behavior and presentation to your reference app, and the interaction plots now come from a true strain compatibility workflow for both rectangular and circular sections
-        - The 2D `PMM` slice and 3D surface are built from the uniaxial strain-compatibility capacities plus the selected biaxial load contour exponent `alpha`
+        - The 2D `PMM` slice and 3D surface in the `Section` tab are now built from true rotated-neutral-axis strain compatibility, while the auto-design screening and summary biaxial ratio still use the faster load contour approximation
         - Final design should still verify the governing code, moment effects, slenderness, confinement, pile driving or precast detailing limits, splice/development, and project-specific requirements
         """
     )
