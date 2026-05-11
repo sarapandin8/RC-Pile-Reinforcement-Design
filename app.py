@@ -1087,27 +1087,20 @@ def pmm_surface_plot(
 ) -> go.Figure:
     if not responses:
         return go.Figure()
-    theta_values = sorted({item["theta_rad"] for item in responses})
-    c_values = sorted({item["c_mm"] for item in responses})
-    by_key = {(item["theta_rad"], item["c_mm"]): item for item in responses}
+    theta_count = len(sorted({item["theta_rad"] for item in responses}))
+    expected_points = theta_count + 1
+    p_max = max(item["phi_pn_kN"] for item in responses)
+    p_levels = [p_max * i / 24.0 for i in range(1, 25)]
     x_grid: list[list[float]] = []
     y_grid: list[list[float]] = []
     z_grid: list[list[float]] = []
-    for c_value in c_values:
-        row_x: list[float] = []
-        row_y: list[float] = []
-        row_z: list[float] = []
-        for theta in theta_values:
-            item = by_key.get((theta, c_value))
-            if item is None:
-                continue
-            row_x.append(item["phi_mx_kNm"])
-            row_y.append(item["phi_my_kNm"])
-            row_z.append(item["phi_pn_kN"])
-        if row_x:
-            x_grid.append(row_x)
-            y_grid.append(row_y)
-            z_grid.append(row_z)
+    for p_level in p_levels:
+        contour_at_p = pmm_slice_from_responses(responses, p_level)
+        if contour_at_p.empty or len(contour_at_p) != expected_points:
+            continue
+        x_grid.append(contour_at_p["mx_kNm"].tolist())
+        y_grid.append(contour_at_p["my_kNm"].tolist())
+        z_grid.append([p_level] * len(contour_at_p))
 
     current_slice = contour_df.copy()
     fig = go.Figure()
