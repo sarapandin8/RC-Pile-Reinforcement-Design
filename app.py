@@ -27,6 +27,7 @@ class SectionGeometry:
 @dataclass(frozen=True)
 class DesignResult:
     ast_required_mm2: float
+    ast_axial_starter_mm2: float
     ast_from_equation_mm2: float
     ast_min_mm2: float
     ast_max_mm2: float
@@ -35,11 +36,12 @@ class DesignResult:
     spacing_ok: bool
     spacing_note: str
     overall_ok: bool
-    eccentricity_mm: float
+    minimum_eccentricity_mm: float
     governing_ratio: float = 0.0
     governing_load_case: str = ""
     phi_mnx_at_pu_kNm: float = 0.0
     phi_mny_at_pu_kNm: float = 0.0
+    pmm_required_found: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,19 @@ def bar_area_mm2(diameter_mm: float) -> float:
 
 def phi_factor(column_type: str) -> float:
     return 0.65 if column_type == "Tied" else 0.75
+
+
+def strain_based_phi(column_type: str, fy_mpa: float, tensile_strain: float, es_mpa: float = 200000.0) -> float:
+    phi_compression = phi_factor(column_type)
+    phi_tension = 0.90
+    epsilon_y = fy_mpa / es_mpa
+    if tensile_strain <= epsilon_y:
+        return phi_compression
+    if tensile_strain >= 0.005:
+        return phi_tension
+    transition = (tensile_strain - epsilon_y) / (0.005 - epsilon_y) if 0.005 > epsilon_y else 1.0
+    transition = max(0.0, min(1.0, transition))
+    return phi_compression + transition * (phi_tension - phi_compression)
 
 
 def section_geometry(shape: Shape, width_mm: float | None, depth_mm: float | None, diameter_mm: float | None) -> SectionGeometry:
@@ -120,6 +135,55 @@ def required_steel_area_mm2(
     ast_equation = numerator / denominator if denominator > 0 else 0.0
     ast_required = max(ast_min, ast_equation, 0.0)
     return ast_required, ast_equation, ast_min
+
+
+def minimum_eccentricity_mm(geometry: SectionGeometry) -> float:
+    if geometry.shape == "Circular":
+        return 0.1 * float(geometry.diameter_mm)
+    return 0.1 * min(float(geometry.width_mm), float(geometry.depth_mm))
+
+
+def minimum_moment_kNm(pu_kN: float, eccentricity_mm: float) -> float:
+    if pu_kN <= 0.0 or eccentricity_mm <= 0.0:
+        return 0.0
+    return pu_kN * eccentricity_mm / 1000.0
+
+
+def enforce_minimum_eccentricity(
+    pu_kN: float,
+    mx_kNm: float,
+    my_kNm: float,
+    eccentricity_mm: float,
+    mnx_kNm: float,
+    mny_kNm: float,
+) -> tuple[float, float, float, bool]:
+    m_min_kNm = minimum_moment_kNm(pu_kN, eccentricity_mm)
+    resultant = math.hypot(mx_kNm, my_kNm)
+    if m_min_kNm <= 0.0 or resultant >= m_min_kNm:
+        return mx_kNm, my_kNm, m_min_kNm, False
+    if resultant > 1e-9:
+        scale = m_min_kNm / resultant
+        return mx_kNm * scale, my_kNm * scale, m_min_kNm, True
+    if mnx_kNm <= mny_kNm:
+        return m_min_kNm, 0.0, m_min_kNm, True
+    return 0.0, m_min_kNm, m_min_kNm, True
+
+
+def layout_total_bars(
+    shape: Shape,
+    bars_width_face: int | None = None,
+    bars_depth_face: int | None = None,
+    bars_circular: int | None = None,
+) -> int:
+    if shape == "Circular":
+        return int(bars_circular or 0)
+    return total_bars_rectangular(int(bars_width_face or 0), int(bars_depth_face or 0))
+
+
+def format_required_ast(ast_required_mm2: float, found: bool, ast_max_mm2: float) -> str:
+    if found and math.isfinite(ast_required_mm2):
+        return f"{ast_required_mm2:,.1f} mm2"
+    return f"> {ast_max_mm2:,.1f} mm2"
 
 
 def minimum_clear_spacing_mm(bar_dia_mm: float, user_min_clear_spacing_mm: float) -> float:
@@ -304,7 +368,7 @@ def section_response(
 
     nominal_p_n = concrete_force_n + steel_force_n
     nominal_m_nmm = concrete_moment_nmm + steel_moment_nmm
-    return nominal_p_n, abs(nominal_m_nmm), max_tension_strain
+    return nominal_p_n, nominal_m_nmm, max_tension_strain
 
 
 def interaction_curve(
@@ -316,8 +380,10 @@ def interaction_curve(
     fc_mpa: float,
     fy_mpa: float,
     phi: float,
+    column_type: str,
     axial_cap_factor_value: float,
     axis: Literal["x", "y"],
+    bar_area_single_override_mm2: float | None = None,
     bars_width_face: int | None = None,
     bars_depth_face: int | None = None,
     bars_circular: int | None = None,
@@ -332,7 +398,7 @@ def interaction_curve(
         bars_depth_face=bars_depth_face,
         bars_circular=bars_circular,
     )
-    bar_area_single = bar_area_mm2(bar_dia_mm)
+    bar_area_single = bar_area_single_override_mm2 if bar_area_single_override_mm2 is not None else bar_area_mm2(bar_dia_mm)
     total_ast_mm2 = len(coords) * bar_area_single
     depth = section_depth_along_axis(geometry, axis)
     c_values = [1.0, 5.0, 10.0]
@@ -353,8 +419,8 @@ def interaction_curve(
         )
         rows.append(
             InteractionPoint(
-                phi_pn_kN=phi * nominal_p_n / 1000.0,
-                phi_mn_kNm=phi * nominal_m_nmm / 1_000_000.0,
+                phi_pn_kN=strain_based_phi(column_type, fy_mpa, max_tension_strain) * nominal_p_n / 1000.0,
+                phi_mn_kNm=strain_based_phi(column_type, fy_mpa, max_tension_strain) * abs(nominal_m_nmm) / 1_000_000.0,
                 neutral_axis_mm=c,
                 max_tension_strain=max_tension_strain,
             )
@@ -397,40 +463,183 @@ def moment_capacity_at_pu(curve_df: pd.DataFrame, pu_kN: float) -> float:
     return max(0.0, max(moments))
 
 
-def biaxial_ratio(mx_kNm: float, my_kNm: float, mnx_kNm: float, mny_kNm: float, alpha: float) -> float:
-    if mnx_kNm <= 0.0 or mny_kNm <= 0.0:
-        return float("inf")
-    return (abs(mx_kNm) / mnx_kNm) ** alpha + (abs(my_kNm) / mny_kNm) ** alpha
-
-
-def evaluate_load_cases(load_df: pd.DataFrame, curve_x: pd.DataFrame, curve_y: pd.DataFrame, alpha: float) -> tuple[pd.DataFrame, dict]:
+def evaluate_load_cases_true(
+    load_df: pd.DataFrame,
+    curve_x: pd.DataFrame,
+    curve_y: pd.DataFrame,
+    pmm_responses: list[dict],
+    eccentricity_mm: float,
+) -> tuple[pd.DataFrame, dict]:
     rows: list[dict] = []
     governing: dict | None = None
 
     for _, row in load_df.iterrows():
         case = str(row["Case"])
         pu = float(row["Pu (kN)"])
-        mx = float(row["Mx (kN-m)"])
-        my = float(row["My (kN-m)"])
+        mx_input = float(row["Mx (kN-m)"])
+        my_input = float(row["My (kN-m)"])
         mnx = moment_capacity_at_pu(curve_x, pu)
         mny = moment_capacity_at_pu(curve_y, pu)
-        ratio = biaxial_ratio(mx, my, mnx, mny, alpha)
+        mx, my, m_min, min_ecc_applied = enforce_minimum_eccentricity(pu, mx_input, my_input, eccentricity_mm, mnx, mny)
+        contour = pmm_slice_from_responses(pmm_responses, pu)
+        ratio = ray_polygon_utilization(contour, mx, my)
         status = "OK" if ratio <= 1.0 else "NG"
         item = {
             "Case": case,
             "Pu (kN)": round(pu, 1),
-            "Mx (kN-m)": round(mx, 1),
-            "My (kN-m)": round(my, 1),
+            "Mx input (kN-m)": round(mx_input, 1),
+            "My input (kN-m)": round(my_input, 1),
+            "Mx used (kN-m)": round(mx, 1),
+            "My used (kN-m)": round(my, 1),
+            "Mmin from e_min (kN-m)": round(m_min, 1),
+            "Min ecc applied": "Yes" if min_ecc_applied else "No",
             "phi Mnx at Pu (kN-m)": round(mnx, 1),
             "phi Mny at Pu (kN-m)": round(mny, 1),
-            "Biaxial ratio": round(ratio, 3) if math.isfinite(ratio) else None,
+            "PMM ratio": round(ratio, 3) if math.isfinite(ratio) else None,
             "Status": status,
         }
         rows.append(item)
         if governing is None or ratio > governing["ratio"]:
-            governing = {"case": case, "ratio": ratio, "mnx": mnx, "mny": mny, "pu": pu, "mx": mx, "my": my}
+            governing = {
+                "case": case,
+                "ratio": ratio,
+                "mnx": mnx,
+                "mny": mny,
+                "pu": pu,
+                "mx": mx,
+                "my": my,
+                "mx_input": mx_input,
+                "my_input": my_input,
+                "m_min": m_min,
+                "min_ecc_applied": min_ecc_applied,
+                "contour": contour,
+            }
 
-    return pd.DataFrame(rows), (governing or {"case": "", "ratio": 0.0, "mnx": 0.0, "mny": 0.0, "pu": 0.0, "mx": 0.0, "my": 0.0})
+    return pd.DataFrame(rows), (
+        governing
+        or {
+            "case": "",
+            "ratio": 0.0,
+            "mnx": 0.0,
+            "mny": 0.0,
+            "pu": 0.0,
+            "mx": 0.0,
+            "my": 0.0,
+            "mx_input": 0.0,
+            "my_input": 0.0,
+            "m_min": 0.0,
+            "min_ecc_applied": False,
+            "contour": pd.DataFrame(),
+        }
+    )
+
+
+@st.cache_data(show_spinner=False)
+def solve_required_ast_from_pmm(
+    geometry: SectionGeometry,
+    shape: Shape,
+    cover_mm: float,
+    tie_dia_mm: float,
+    bar_dia_mm: float,
+    fc_mpa: float,
+    fy_mpa: float,
+    phi: float,
+    column_type: str,
+    axial_cap_factor_value: float,
+    min_ratio: float,
+    max_ratio: float,
+    load_df: pd.DataFrame,
+    bars_width_face: int | None = None,
+    bars_depth_face: int | None = None,
+    bars_circular: int | None = None,
+) -> tuple[float, bool]:
+    total_bars = layout_total_bars(shape, bars_width_face, bars_depth_face, bars_circular)
+    if total_bars <= 0:
+        return float("nan"), False
+
+    ast_min = min_ratio * geometry.ag_mm2
+    ast_max = max_ratio * geometry.ag_mm2
+    current_ast = total_bars * bar_area_mm2(bar_dia_mm)
+    eccentricity_value = minimum_eccentricity_mm(geometry)
+
+    def governing_ratio_for_ast(total_ast_mm2: float) -> float:
+        bar_area_single = total_ast_mm2 / total_bars
+        curve_x = interaction_curve(
+            geometry=geometry,
+            shape=shape,
+            cover_mm=cover_mm,
+            tie_dia_mm=tie_dia_mm,
+            bar_dia_mm=bar_dia_mm,
+            fc_mpa=fc_mpa,
+            fy_mpa=fy_mpa,
+            phi=phi,
+            column_type=column_type,
+            axial_cap_factor_value=axial_cap_factor_value,
+            axis="x",
+            bar_area_single_override_mm2=bar_area_single,
+            bars_width_face=bars_width_face,
+            bars_depth_face=bars_depth_face,
+            bars_circular=bars_circular,
+        )
+        curve_y = interaction_curve(
+            geometry=geometry,
+            shape=shape,
+            cover_mm=cover_mm,
+            tie_dia_mm=tie_dia_mm,
+            bar_dia_mm=bar_dia_mm,
+            fc_mpa=fc_mpa,
+            fy_mpa=fy_mpa,
+            phi=phi,
+            column_type=column_type,
+            axial_cap_factor_value=axial_cap_factor_value,
+            axis="y",
+            bar_area_single_override_mm2=bar_area_single,
+            bars_width_face=bars_width_face,
+            bars_depth_face=bars_depth_face,
+            bars_circular=bars_circular,
+        )
+        pmm_responses = rotated_pmm_responses(
+            geometry=geometry,
+            shape=shape,
+            cover_mm=cover_mm,
+            tie_dia_mm=tie_dia_mm,
+            bar_dia_mm=bar_dia_mm,
+            fc_mpa=fc_mpa,
+            fy_mpa=fy_mpa,
+            phi=phi,
+            column_type=column_type,
+            axial_cap_factor_value=axial_cap_factor_value,
+            bar_area_single_override_mm2=bar_area_single,
+            bars_width_face=bars_width_face,
+            bars_depth_face=bars_depth_face,
+            bars_circular=bars_circular,
+            angle_count=31,
+            target_fiber_size_mm=25.0,
+        )
+        _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
+        return float(governing["ratio"])
+
+    lower = max(ast_min, 1e-6)
+    lower_ratio = governing_ratio_for_ast(lower)
+    if lower_ratio <= 1.0:
+        return lower, True
+
+    upper = min(max(current_ast, lower), ast_max)
+    upper_ratio = governing_ratio_for_ast(upper)
+    while upper_ratio > 1.0 and upper < ast_max - 1e-6:
+        upper = min(ast_max, max(upper * 1.35, upper + 0.05 * geometry.ag_mm2))
+        upper_ratio = governing_ratio_for_ast(upper)
+
+    if upper_ratio > 1.0:
+        return float("nan"), False
+
+    for _ in range(12):
+        mid = 0.5 * (lower + upper)
+        if governing_ratio_for_ast(mid) <= 1.0:
+            upper = mid
+        else:
+            lower = mid
+    return upper, True
 
 
 def analyze_manual_layout(
@@ -442,11 +651,12 @@ def analyze_manual_layout(
     phi: float,
     fc_mpa: float,
     fy_mpa: float,
-    pu_kN: float,
     min_ratio: float,
     max_ratio: float,
     shape: Shape,
     axial_cap_factor_value: float,
+    ast_required_pmm_mm2: float,
+    pmm_required_found: bool,
     governing_pu_kN: float,
     governing_case_name: str,
     governing_ratio: float,
@@ -457,7 +667,7 @@ def analyze_manual_layout(
     bars_circular: int | None = None,
 ) -> DesignResult:
     min_clear = minimum_clear_spacing_mm(bar_dia_mm, min_clear_spacing_user_mm)
-    ast_required, ast_equation, ast_min = required_steel_area_mm2(
+    ast_axial_starter, ast_equation, ast_min = required_steel_area_mm2(
         governing_pu_kN,
         phi,
         fc_mpa,
@@ -479,7 +689,6 @@ def analyze_manual_layout(
             n_bars=n_bars,
             min_clear_spacing_mm=min_clear,
         )
-        eccentricity = 0.0
     else:
         n_bars = total_bars_rectangular(int(bars_width_face or 0), int(bars_depth_face or 0))
         ast = n_bars * bar_area_mm2(bar_dia_mm)
@@ -493,12 +702,13 @@ def analyze_manual_layout(
             bars_depth_face=int(bars_depth_face or 0),
             min_clear_spacing_mm=min_clear,
         )
-        eccentricity = 0.1 * min(float(geometry.width_mm), float(geometry.depth_mm))
+    minimum_ecc_value = minimum_eccentricity_mm(geometry)
 
     phi_pn = design_strength_kN(phi, fc_mpa, fy_mpa, geometry.ag_mm2, ast, axial_cap_factor_value)
-    overall_ok = spacing_ok and ast >= ast_required and ast <= ast_max and governing_ratio <= 1.0 and phi_pn >= governing_pu_kN
+    overall_ok = spacing_ok and ast >= ast_min and ast <= ast_max and governing_ratio <= 1.0
     return DesignResult(
-        ast_required_mm2=ast_required,
+        ast_required_mm2=ast_required_pmm_mm2,
+        ast_axial_starter_mm2=ast_axial_starter,
         ast_from_equation_mm2=ast_equation,
         ast_min_mm2=ast_min,
         ast_max_mm2=ast_max,
@@ -507,11 +717,12 @@ def analyze_manual_layout(
         spacing_ok=spacing_ok,
         spacing_note=spacing_note,
         overall_ok=overall_ok,
-        eccentricity_mm=eccentricity,
+        minimum_eccentricity_mm=minimum_ecc_value,
         governing_ratio=governing_ratio,
         governing_load_case=governing_case_name,
         phi_mnx_at_pu_kNm=phi_mnx_at_pu_kNm,
         phi_mny_at_pu_kNm=phi_mny_at_pu_kNm,
+        pmm_required_found=pmm_required_found,
     )
 
 
@@ -522,23 +733,44 @@ def auto_design_options(
     fc_mpa: float,
     fy_mpa: float,
     phi: float,
+    column_type: str,
     min_ratio: float,
     max_ratio: float,
     min_clear_spacing_user_mm: float,
     shape: Shape,
     bar_sizes_mm: list[float],
     load_df: pd.DataFrame,
-    biaxial_alpha: float,
     axial_cap_factor_value: float,
 ) -> pd.DataFrame:
     rows: list[dict] = []
+    max_pu_for_prefilter = float(load_df["Pu (kN)"].max()) if not load_df.empty else 0.0
+    ast_required_prefilter, _, _ = required_steel_area_mm2(max_pu_for_prefilter, phi, fc_mpa, fy_mpa, geometry.ag_mm2, min_ratio, axial_cap_factor_value)
+    eccentricity_value = minimum_eccentricity_mm(geometry)
 
     for dia in bar_sizes_mm:
         if shape == "Circular":
             for n_bars in range(6, 33):
-                curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "x", bars_circular=n_bars)
-                curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "y", bars_circular=n_bars)
-                _, governing = evaluate_load_cases(load_df, curve_x, curve_y, biaxial_alpha)
+                ast = n_bars * bar_area_mm2(dia)
+                if ast < ast_required_prefilter or ast > max_ratio * geometry.ag_mm2:
+                    continue
+                curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "x", bars_circular=n_bars)
+                curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "y", bars_circular=n_bars)
+                pmm_responses = rotated_pmm_responses(
+                    geometry=geometry,
+                    shape=shape,
+                    cover_mm=cover_mm,
+                    tie_dia_mm=tie_dia_mm,
+                    bar_dia_mm=dia,
+                    fc_mpa=fc_mpa,
+                    fy_mpa=fy_mpa,
+                    phi=phi,
+                    column_type=column_type,
+                    axial_cap_factor_value=axial_cap_factor_value,
+                    bars_circular=n_bars,
+                    angle_count=19,
+                    target_fiber_size_mm=40.0,
+                )
+                _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
                 result = analyze_manual_layout(
                     geometry=geometry,
                     cover_mm=cover_mm,
@@ -548,11 +780,12 @@ def auto_design_options(
                     phi=phi,
                     fc_mpa=fc_mpa,
                     fy_mpa=fy_mpa,
-                    pu_kN=governing["pu"],
                     min_ratio=min_ratio,
                     max_ratio=max_ratio,
                     shape=shape,
                     axial_cap_factor_value=axial_cap_factor_value,
+                    ast_required_pmm_mm2=ast,
+                    pmm_required_found=True,
                     governing_pu_kN=governing["pu"],
                     governing_case_name=governing["case"],
                     governing_ratio=governing["ratio"],
@@ -560,7 +793,6 @@ def auto_design_options(
                     phi_mny_at_pu_kNm=governing["mny"],
                     bars_circular=n_bars,
                 )
-                ast = n_bars * bar_area_mm2(dia)
                 if result.spacing_ok and ast <= result.ast_max_mm2 and result.overall_ok:
                     rows.append(
                         {
@@ -570,7 +802,7 @@ def auto_design_options(
                             "Ast provided (mm2)": round(ast, 1),
                             "Steel ratio (%)": round(result.steel_ratio_percent, 3),
                             "Governing case": governing["case"],
-                            "Biaxial ratio": round(governing["ratio"], 3),
+                            "PMM ratio": round(governing["ratio"], 3),
                             "phi Pn (kN)": round(result.phi_pn_kN, 1),
                             "Spacing note": result.spacing_note,
                         }
@@ -581,9 +813,28 @@ def auto_design_options(
                     total = total_bars_rectangular(bx, by)
                     if total < 4:
                         continue
-                    curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "x", bars_width_face=bx, bars_depth_face=by)
-                    curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "y", bars_width_face=bx, bars_depth_face=by)
-                    _, governing = evaluate_load_cases(load_df, curve_x, curve_y, biaxial_alpha)
+                    ast = total * bar_area_mm2(dia)
+                    if ast < ast_required_prefilter or ast > max_ratio * geometry.ag_mm2:
+                        continue
+                    curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "x", bars_width_face=bx, bars_depth_face=by)
+                    curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "y", bars_width_face=bx, bars_depth_face=by)
+                    pmm_responses = rotated_pmm_responses(
+                        geometry=geometry,
+                        shape=shape,
+                        cover_mm=cover_mm,
+                        tie_dia_mm=tie_dia_mm,
+                        bar_dia_mm=dia,
+                        fc_mpa=fc_mpa,
+                        fy_mpa=fy_mpa,
+                        phi=phi,
+                        column_type=column_type,
+                        axial_cap_factor_value=axial_cap_factor_value,
+                        bars_width_face=bx,
+                        bars_depth_face=by,
+                        angle_count=19,
+                        target_fiber_size_mm=40.0,
+                    )
+                    _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
                     result = analyze_manual_layout(
                         geometry=geometry,
                         cover_mm=cover_mm,
@@ -593,11 +844,12 @@ def auto_design_options(
                         phi=phi,
                         fc_mpa=fc_mpa,
                         fy_mpa=fy_mpa,
-                        pu_kN=governing["pu"],
                         min_ratio=min_ratio,
                         max_ratio=max_ratio,
                         shape=shape,
                         axial_cap_factor_value=axial_cap_factor_value,
+                        ast_required_pmm_mm2=ast,
+                        pmm_required_found=True,
                         governing_pu_kN=governing["pu"],
                         governing_case_name=governing["case"],
                         governing_ratio=governing["ratio"],
@@ -606,7 +858,6 @@ def auto_design_options(
                         bars_width_face=bx,
                         bars_depth_face=by,
                     )
-                    ast = total * bar_area_mm2(dia)
                     if result.spacing_ok and ast <= result.ast_max_mm2 and result.overall_ok:
                         rows.append(
                             {
@@ -616,7 +867,7 @@ def auto_design_options(
                                 "Ast provided (mm2)": round(ast, 1),
                                 "Steel ratio (%)": round(result.steel_ratio_percent, 3),
                                 "Governing case": governing["case"],
-                                "Biaxial ratio": round(governing["ratio"], 3),
+                                "PMM ratio": round(governing["ratio"], 3),
                                 "phi Pn (kN)": round(result.phi_pn_kN, 1),
                                 "Spacing note": result.spacing_note,
                             }
@@ -853,6 +1104,7 @@ def rotated_section_response(
     fc_mpa: float,
     fy_mpa: float,
     phi: float,
+    column_type: str,
     axial_cap_factor_value: float,
     fibers: list[tuple[float, float, float]],
     bar_coords: list[tuple[float, float]],
@@ -892,7 +1144,8 @@ def rotated_section_response(
         my_nmm += force * x
 
     nominal_p_n = concrete_force_n + steel_force_n
-    phi_pn_kN = phi * nominal_p_n / 1000.0
+    phi_value = strain_based_phi(column_type, fy_mpa, max_tension_strain)
+    phi_pn_kN = phi_value * nominal_p_n / 1000.0
     phi_pn_max_kN = design_strength_kN(
         phi=phi,
         fc_mpa=fc_mpa,
@@ -903,8 +1156,9 @@ def rotated_section_response(
     )
     return {
         "phi_pn_kN": min(phi_pn_kN, phi_pn_max_kN),
-        "phi_mx_kNm": phi * mx_nmm / 1_000_000.0,
-        "phi_my_kNm": phi * my_nmm / 1_000_000.0,
+        "phi_mx_kNm": phi_value * mx_nmm / 1_000_000.0,
+        "phi_my_kNm": phi_value * my_nmm / 1_000_000.0,
+        "phi_value": phi_value,
         "max_tension_strain": max_tension_strain,
     }
 
@@ -922,13 +1176,16 @@ def rotated_pmm_responses(
     fc_mpa: float,
     fy_mpa: float,
     phi: float,
+    column_type: str,
     axial_cap_factor_value: float,
+    bar_area_single_override_mm2: float | None = None,
     bars_width_face: int | None = None,
     bars_depth_face: int | None = None,
     bars_circular: int | None = None,
     angle_count: int = 49,
+    target_fiber_size_mm: float = 25.0,
 ) -> list[dict]:
-    fibers = concrete_fibers(geometry, shape)
+    fibers = concrete_fibers(geometry, shape, target_fiber_size_mm=target_fiber_size_mm)
     bar_coords = section_bar_coordinates(
         geometry=geometry,
         shape=shape,
@@ -939,7 +1196,7 @@ def rotated_pmm_responses(
         bars_depth_face=bars_depth_face,
         bars_circular=bars_circular,
     )
-    bar_area_single = bar_area_mm2(bar_dia_mm)
+    bar_area_single = bar_area_single_override_mm2 if bar_area_single_override_mm2 is not None else bar_area_mm2(bar_dia_mm)
     responses: list[dict] = []
     for angle_index in range(angle_count):
         theta = 2.0 * math.pi * angle_index / angle_count
@@ -954,6 +1211,7 @@ def rotated_pmm_responses(
                 fc_mpa=fc_mpa,
                 fy_mpa=fy_mpa,
                 phi=phi,
+                column_type=column_type,
                 axial_cap_factor_value=axial_cap_factor_value,
                 fibers=fibers,
                 bar_coords=bar_coords,
@@ -966,6 +1224,8 @@ def rotated_pmm_responses(
                     "phi_pn_kN": response["phi_pn_kN"],
                     "phi_mx_kNm": response["phi_mx_kNm"],
                     "phi_my_kNm": response["phi_my_kNm"],
+                    "phi_value": response["phi_value"],
+                    "max_tension_strain": response["max_tension_strain"],
                 }
             )
     return responses
@@ -1165,6 +1425,80 @@ def pmm_surface_plot(
     return fig
 
 
+def _nonclosing_points(contour_df: pd.DataFrame) -> pd.DataFrame:
+    if contour_df.empty:
+        return contour_df
+    if len(contour_df) > 1 and abs(contour_df.iloc[0]["mx_kNm"] - contour_df.iloc[-1]["mx_kNm"]) < 1e-9 and abs(contour_df.iloc[0]["my_kNm"] - contour_df.iloc[-1]["my_kNm"]) < 1e-9:
+        return contour_df.iloc[:-1].copy()
+    return contour_df.copy()
+
+
+@st.cache_data(show_spinner=False)
+def run_verification_suite() -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    column_type = "Tied"
+    compression_phi = phi_factor(column_type)
+    cap = axial_cap_factor(column_type)
+
+    square_geo = section_geometry("Square", 400.0, 400.0, None)
+    square_curve_x = interaction_curve(square_geo, "Square", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_width_face=4, bars_depth_face=4)
+    square_curve_y = interaction_curve(square_geo, "Square", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_width_face=4, bars_depth_face=4)
+    square_pu = 0.4 * min(float(square_curve_x["phi_pn_kN"].max()), float(square_curve_y["phi_pn_kN"].max()))
+    square_mnx = moment_capacity_at_pu(square_curve_x, square_pu)
+    square_mny = moment_capacity_at_pu(square_curve_y, square_pu)
+    square_diff = abs(square_mnx - square_mny) / max(square_mnx, square_mny, 1e-9)
+    rows.append(
+        {
+            "Benchmark": "Square symmetry",
+            "Check": "Mnx(Pu) vs Mny(Pu)",
+            "Result": f"{square_mnx:,.1f} vs {square_mny:,.1f} kN-m",
+            "Error": f"{square_diff * 100.0:.2f}%",
+            "Status": "OK" if square_diff <= 0.05 else "Review",
+        }
+    )
+
+    rect_geo = section_geometry("Rectangle", 300.0, 500.0, None)
+    rect_curve_x = interaction_curve(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_width_face=4, bars_depth_face=4)
+    rect_curve_y = interaction_curve(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_width_face=4, bars_depth_face=4)
+    rect_responses = rotated_pmm_responses(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, bars_width_face=4, bars_depth_face=4, angle_count=72, target_fiber_size_mm=25.0)
+    rect_pu = 0.4 * min(float(rect_curve_x["phi_pn_kN"].max()), float(rect_curve_y["phi_pn_kN"].max()))
+    rect_slice = _nonclosing_points(pmm_slice_from_responses(rect_responses, rect_pu))
+    rect_mnx = moment_capacity_at_pu(rect_curve_x, rect_pu)
+    rect_mny = moment_capacity_at_pu(rect_curve_y, rect_pu)
+    rect_slice_mx = abs(rect_slice["mx_kNm"]).max() if not rect_slice.empty else 0.0
+    rect_slice_my = abs(rect_slice["my_kNm"]).max() if not rect_slice.empty else 0.0
+    rect_error = max(abs(rect_slice_mx - rect_mnx) / max(rect_mnx, 1e-9), abs(rect_slice_my - rect_mny) / max(rect_mny, 1e-9))
+    rows.append(
+        {
+            "Benchmark": "Rectangle axis consistency",
+            "Check": "PMM slice intercepts vs uniaxial curves",
+            "Result": f"x: {rect_slice_mx:,.1f}/{rect_mnx:,.1f}, y: {rect_slice_my:,.1f}/{rect_mny:,.1f}",
+            "Error": f"{rect_error * 100.0:.2f}%",
+            "Status": "OK" if rect_error <= 0.10 else "Review",
+        }
+    )
+
+    circ_geo = section_geometry("Circular", None, None, 600.0)
+    circ_responses = rotated_pmm_responses(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, bars_circular=8, angle_count=72, target_fiber_size_mm=20.0)
+    circ_curve_x = interaction_curve(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_circular=8)
+    circ_curve_y = interaction_curve(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_circular=8)
+    circ_pu = 0.4 * min(float(circ_curve_x["phi_pn_kN"].max()), float(circ_curve_y["phi_pn_kN"].max()))
+    circ_slice = _nonclosing_points(pmm_slice_from_responses(circ_responses, circ_pu))
+    radii = [math.hypot(float(mx), float(my)) for mx, my in zip(circ_slice["mx_kNm"], circ_slice["my_kNm"])] if not circ_slice.empty else []
+    circ_cov = (pd.Series(radii).std() / max(pd.Series(radii).mean(), 1e-9)) if radii else float("inf")
+    rows.append(
+        {
+            "Benchmark": "Circular rotational invariance",
+            "Check": "Radius variation on PMM slice",
+            "Result": f"mean R = {pd.Series(radii).mean():,.1f} kN-m" if radii else "No slice",
+            "Error": f"{circ_cov * 100.0:.2f}%",
+            "Status": "OK" if circ_cov <= 0.08 else "Review",
+        }
+    )
+
+    return pd.DataFrame(rows)
+
+
 def clean_load_cases(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = ["Case", "Pu (kN)", "Mx (kN-m)", "My (kN-m)"]
     working = df.copy()
@@ -1212,7 +1546,7 @@ def project_payload(data: dict) -> str:
 st.set_page_config(page_title="Pile Reinforcement Designer", page_icon="P", layout="wide", initial_sidebar_state="expanded")
 
 st.title("Pile Reinforcement Designer")
-st.caption("Preliminary RC pile longitudinal reinforcement design for square, rectangular, and circular sections with auto design, manual check, layout plots, and save/load workflow.")
+st.caption("Preliminary RC pile longitudinal reinforcement design for square, rectangular, and circular sections using strain compatibility interaction curves, true PMM checks, auto design, manual check, layout plots, and save/load workflow.")
 
 with st.sidebar:
     st.markdown("### Save / Load Design")
@@ -1229,7 +1563,6 @@ with st.sidebar:
         "min_ratio_percent": 1.0,
         "max_ratio_percent": 8.0,
         "min_clear_spacing_mm": 40.0,
-        "biaxial_alpha": 1.0,
         "mode": "Auto design",
         "manual_bar_dia_mm": 20.0,
         "bars_width_face": 4,
@@ -1251,11 +1584,10 @@ with st.sidebar:
             st.error(f"Could not open project file: {exc}")
 
     st.header("Design Basis")
-    code_basis = st.selectbox("Reference basis", ["ACI-style simplified axial compression"], index=0)
+    code_basis = st.selectbox("Reference basis", ["Strain Compatibility PMM (ACI 318-19 style)"], index=0)
     column_type = st.radio("Transverse reinforcement type", ["Tied", "Spiral"], horizontal=True, key="column_type")
     min_ratio_percent = st.number_input("Minimum rho for auto (%)", min_value=0.1, max_value=8.0, step=0.1, key="min_ratio_percent")
     max_ratio_percent = st.number_input("Maximum rho for auto (%)", min_value=1.0, max_value=12.0, step=0.1, key="max_ratio_percent")
-    biaxial_alpha = st.number_input("Biaxial alpha", min_value=1.0, max_value=2.0, step=0.1, key="biaxial_alpha")
     min_clear_spacing_user_mm = st.number_input("Minimum clear spacing (mm)", min_value=25.0, max_value=200.0, step=5.0, key="min_clear_spacing_mm")
     tie_dia_mm = st.number_input("Tie / spiral diameter (mm)", min_value=6.0, max_value=20.0, step=1.0, key="tie_dia_mm")
     available_sizes_text = st.text_input("Available main bar diameters (mm)", key="available_sizes_text")
@@ -1316,6 +1648,10 @@ phi = phi_factor(column_type)
 axial_cap = axial_cap_factor(column_type)
 min_ratio = min_ratio_percent / 100.0
 max_ratio = max_ratio_percent / 100.0
+eccentricity_value = minimum_eccentricity_mm(geometry)
+bars_width_face_int = int(bars_width_face) if bars_width_face is not None else None
+bars_depth_face_int = int(bars_depth_face) if bars_depth_face is not None else None
+bars_circular_int = int(bars_circular) if bars_circular is not None else None
 
 available_sizes = parse_available_bar_sizes(available_sizes_text)
 if not available_sizes:
@@ -1330,11 +1666,12 @@ curve_x_manual = interaction_curve(
     fc_mpa=fc_mpa,
     fy_mpa=fy_mpa,
     phi=phi,
+    column_type=column_type,
     axial_cap_factor_value=axial_cap,
     axis="x",
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
 )
 curve_y_manual = interaction_curve(
     geometry=geometry,
@@ -1345,13 +1682,47 @@ curve_y_manual = interaction_curve(
     fc_mpa=fc_mpa,
     fy_mpa=fy_mpa,
     phi=phi,
+    column_type=column_type,
     axial_cap_factor_value=axial_cap,
     axis="y",
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
 )
-load_case_results_df, governing_case = evaluate_load_cases(load_cases_df, curve_x_manual, curve_y_manual, biaxial_alpha)
+pmm_responses_true = rotated_pmm_responses(
+    geometry=geometry,
+    shape=shape,
+    cover_mm=cover_mm,
+    tie_dia_mm=tie_dia_mm,
+    bar_dia_mm=float(manual_bar_dia_mm),
+    fc_mpa=fc_mpa,
+    fy_mpa=fy_mpa,
+    phi=phi,
+    column_type=column_type,
+    axial_cap_factor_value=axial_cap,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
+)
+load_case_results_df, governing_case = evaluate_load_cases_true(load_cases_df, curve_x_manual, curve_y_manual, pmm_responses_true, eccentricity_value)
+pmm_required_ast_mm2, pmm_required_found = solve_required_ast_from_pmm(
+    geometry=geometry,
+    shape=shape,
+    cover_mm=cover_mm,
+    tie_dia_mm=tie_dia_mm,
+    bar_dia_mm=float(manual_bar_dia_mm),
+    fc_mpa=fc_mpa,
+    fy_mpa=fy_mpa,
+    phi=phi,
+    column_type=column_type,
+    axial_cap_factor_value=axial_cap,
+    min_ratio=min_ratio,
+    max_ratio=max_ratio,
+    load_df=load_cases_df,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
+)
 
 manual_result = analyze_manual_layout(
     geometry=geometry,
@@ -1362,26 +1733,25 @@ manual_result = analyze_manual_layout(
     phi=phi,
     fc_mpa=fc_mpa,
     fy_mpa=fy_mpa,
-    pu_kN=governing_case["pu"],
     min_ratio=min_ratio,
     max_ratio=max_ratio,
     shape=shape,
     axial_cap_factor_value=axial_cap,
+    ast_required_pmm_mm2=pmm_required_ast_mm2,
+    pmm_required_found=pmm_required_found,
     governing_pu_kN=governing_case["pu"],
     governing_case_name=governing_case["case"],
     governing_ratio=governing_case["ratio"],
     phi_mnx_at_pu_kNm=governing_case["mnx"],
     phi_mny_at_pu_kNm=governing_case["mny"],
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
 )
 
-if shape == "Circular":
-    total_bars = int(bars_circular)
-else:
-    total_bars = total_bars_rectangular(int(bars_width_face), int(bars_depth_face))
+total_bars = layout_total_bars(shape, bars_width_face_int, bars_depth_face_int, bars_circular_int)
 ast_manual = total_bars * bar_area_mm2(float(manual_bar_dia_mm))
+required_ast_display = format_required_ast(manual_result.ast_required_mm2, manual_result.pmm_required_found, manual_result.ast_max_mm2)
 section_note = section_note_text(
     shape=shape,
     bar_dia_mm=float(manual_bar_dia_mm),
@@ -1389,9 +1759,9 @@ section_note = section_note_text(
     ast_mm2=ast_manual,
     rho_percent=manual_result.steel_ratio_percent,
     spacing_note=manual_result.spacing_note,
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
 )
 
 section_layout_fig = section_figure(
@@ -1401,27 +1771,13 @@ section_layout_fig = section_figure(
     tie_dia_mm=tie_dia_mm,
     bar_dia_mm=float(manual_bar_dia_mm),
     note_text=section_note,
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
+    bars_width_face=bars_width_face_int,
+    bars_depth_face=bars_depth_face_int,
+    bars_circular=bars_circular_int,
 )
 uniaxial_fig = interaction_plot_with_demand(curve_x_manual, curve_y_manual, governing_case["pu"], governing_case["mx"], governing_case["my"])
-pmm_responses_true = rotated_pmm_responses(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    phi=phi,
-    axial_cap_factor_value=axial_cap,
-    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-    bars_circular=int(bars_circular) if bars_circular is not None else None,
-)
-pmm_slice_true_df = pmm_slice_from_responses(pmm_responses_true, governing_case["pu"])
-pmm_true_ratio = ray_polygon_utilization(pmm_slice_true_df, governing_case["mx"], governing_case["my"])
+pmm_slice_true_df = governing_case["contour"].copy() if isinstance(governing_case.get("contour"), pd.DataFrame) else pmm_slice_from_responses(pmm_responses_true, governing_case["pu"])
+pmm_true_ratio = governing_case["ratio"]
 pmm_slice_fig = pmm_slice_plot(
     contour_df=pmm_slice_true_df,
     pu_kN=governing_case["pu"],
@@ -1437,14 +1793,16 @@ pmm_surface_fig = pmm_surface_plot(
     my_kNm=governing_case["my"],
     ratio=pmm_true_ratio,
 )
+verification_df = run_verification_suite()
 
-result_cols = st.columns(6)
+result_cols = st.columns(7)
 result_cols[0].metric("Gross area Ag", f"{geometry.ag_mm2:,.0f} mm2")
 result_cols[1].metric("phi", f"{phi:.2f}")
-result_cols[2].metric("Required Ast", f"{manual_result.ast_required_mm2:,.1f} mm2")
-result_cols[3].metric("Provided Ast", f"{ast_manual:,.1f} mm2")
-result_cols[4].metric("Steel ratio", f"{manual_result.steel_ratio_percent:.3f} %")
-result_cols[5].metric("Governing ratio", f"{manual_result.governing_ratio:.3f}")
+result_cols[2].metric("e_min", f"{manual_result.minimum_eccentricity_mm:.1f} mm")
+result_cols[3].metric("Required Ast from PMM", required_ast_display)
+result_cols[4].metric("Provided Ast", f"{ast_manual:,.1f} mm2")
+result_cols[5].metric("Steel ratio", f"{manual_result.steel_ratio_percent:.3f} %")
+result_cols[6].metric("Governing PMM ratio", f"{manual_result.governing_ratio:.3f}")
 
 if mode == "Auto design":
     with st.spinner("Searching reinforcement layout..."):
@@ -1455,19 +1813,19 @@ if mode == "Auto design":
             fc_mpa=fc_mpa,
             fy_mpa=fy_mpa,
             phi=phi,
+            column_type=column_type,
             min_ratio=min_ratio,
             max_ratio=max_ratio,
             min_clear_spacing_user_mm=min_clear_spacing_user_mm,
             shape=shape,
             bar_sizes_mm=available_sizes,
             load_df=load_cases_df,
-            biaxial_alpha=biaxial_alpha,
             axial_cap_factor_value=axial_cap,
         )
 else:
     options_df = pd.DataFrame()
 
-tabs = st.tabs(["Results", "Section", "Interaction", "Method"])
+tabs = st.tabs(["Results", "Section", "Interaction", "Verification", "Method"])
 
 with tabs[0]:
     status_text = "OK" if manual_result.overall_ok else "NG"
@@ -1476,19 +1834,27 @@ with tabs[0]:
         [
             ["Status", status_text, ""],
             ["Governing case", manual_result.governing_load_case, ""],
-            ["Biaxial ratio", f"{manual_result.governing_ratio:,.3f}", "<= 1.0 required"],
+            ["PMM ratio", f"{manual_result.governing_ratio:,.3f}", "<= 1.0 required"],
             ["Spacing check", "Pass" if manual_result.spacing_ok else "Fail", manual_result.spacing_note],
+            ["Required Ast from PMM", required_ast_display, "Equivalent steel area for the current layout pattern"],
+            ["PMM requirement status", "Solved within rho_max" if manual_result.pmm_required_found else "Exceeds rho_max", ""],
+            ["Axial starter Ast", f"{manual_result.ast_axial_starter_mm2:,.1f}", "mm2"],
             ["Ast from equation", f"{manual_result.ast_from_equation_mm2:,.1f}", "mm2"],
             ["Ast minimum", f"{manual_result.ast_min_mm2:,.1f}", "mm2"],
             ["Ast maximum", f"{manual_result.ast_max_mm2:,.1f}", "mm2"],
             ["Ast provided", f"{ast_manual:,.1f}", "mm2"],
+            ["Minimum eccentricity", f"{manual_result.minimum_eccentricity_mm:,.1f}", "mm"],
+            ["Minimum moment floor at Pu", f"{governing_case['m_min']:,.1f}", "kN-m"],
+            ["Mx input governing", f"{governing_case['mx_input']:,.1f}", "kN-m"],
+            ["My input governing", f"{governing_case['my_input']:,.1f}", "kN-m"],
+            ["Mx used in PMM", f"{governing_case['mx']:,.1f}", "kN-m"],
+            ["My used in PMM", f"{governing_case['my']:,.1f}", "kN-m"],
+            ["Minimum eccentricity applied", "Yes" if governing_case["min_ecc_applied"] else "No", ""],
             ["phi Mnx at governing Pu", f"{manual_result.phi_mnx_at_pu_kNm:,.1f}", "kN-m"],
             ["phi Mny at governing Pu", f"{manual_result.phi_mny_at_pu_kNm:,.1f}", "kN-m"],
             ["phi Pn", f"{manual_result.phi_pn_kN:,.1f}", "kN"],
             ["Axial cap factor", f"{axial_cap:.2f}", "ACI compression limit"],
             ["Pu governing", f"{governing_case['pu']:,.1f}", "kN"],
-            ["Mx governing", f"{governing_case['mx']:,.1f}", "kN-m"],
-            ["My governing", f"{governing_case['my']:,.1f}", "kN-m"],
         ],
         columns=["Item", "Value", "Unit / Note"],
     )
@@ -1549,6 +1915,11 @@ with tabs[2]:
         )
 
 with tabs[3]:
+    st.subheader("Verification Benchmarks")
+    st.dataframe(verification_df, use_container_width=True, hide_index=True)
+    st.caption("These are built-in sanity checks for square, rectangular, and circular benchmark sections. They help confirm symmetry, intercept consistency, and rotational behavior, but they do not replace an external hand-check or certified design software benchmark.")
+
+with tabs[4]:
     st.markdown(
         f"""
         **Workflow intentionally modeled after the reference app**
@@ -1561,14 +1932,14 @@ with tabs[3]:
 
         **Current design basis**
 
-        - Simplified concentric compression check:
-          `phi Pn = phi [0.85 f'c (Ag - Ast) + fy Ast]`
-        - ACI axial compression cap is applied in design strength:
+        - Main section checks use `strain compatibility PMM`, not a simplified load contour
+        - ACI axial compression cap is still enforced on the compression end:
           `phi Pn,max = cap x phi x [0.85 f'c (Ag - Ast) + fy Ast]`
-        - `cap = 0.80` for tied columns and `0.85` for spiral columns in the current app
-        - Required steel from governing axial load case:
+        - `cap = 0.80` for tied columns and `0.85` for spiral columns
+        - The app still computes an axial starter steel estimate from:
           `Ast = (Pu/(cap x phi) - 0.85 f'c Ag) / (fy - 0.85 f'c)`
-        - Adopted `Ast required = max(Ast from equation, Ast minimum, 0)`
+        - The axial starter is used only as a screening and reporting value:
+          `Ast starter = max(Ast from equation, Ast minimum, 0)`
         - Steel ratio limits:
           `rho_min = {min_ratio_percent:.2f}%`
           `rho_max = {max_ratio_percent:.2f}%`
@@ -1584,28 +1955,35 @@ with tabs[3]:
 
         **Strain compatibility interaction engine**
 
-        - Both rectangular and circular sections now generate uniaxial `P-Mx` and `P-My` interaction curves using strain compatibility
+        - Square, rectangular, and circular sections all generate uniaxial `P-Mx` and `P-My` curves using strain compatibility
         - Concrete compression is integrated over the compression zone with `0.85f'c`
         - Steel stress is computed from strain using `Es = 200,000 MPa` and capped at `fy`
         - Bars inside the compression block use net steel stress `(fs - 0.85f'c)` to avoid double counting displaced concrete
-        - Neutral axis depth is swept through multiple values to build the full interaction curve
-        - The compression end of the interaction curve is capped to the ACI axial compression limit for tied/spiral columns
+        - Uniaxial curves use strain-based `phi` transition between compression-controlled and tension-controlled behavior
+        - The compression end of the uniaxial curve is capped to the ACI axial compression limit for tied/spiral columns
 
         **Biaxial bending check**
 
-        - The app evaluates every load case in the input table
-        - At each `Pu`, it interpolates `phi Mnx(Pu)` and `phi Mny(Pu)` from the interaction curves
-        - Biaxial utilization is checked with load contour form:
-          `(Mx / phi Mnx)^alpha + (My / phi Mny)^alpha <= 1.0`
-        - `alpha = {biaxial_alpha:.2f}` in the current run
-        - The worst load case becomes the governing case for the manual summary and for auto design filtering
+        - Every load case in the input table is checked against the true rotated-neutral-axis PMM surface
+        - At each `Pu`, the app also interpolates `phi Mnx(Pu)` and `phi Mny(Pu)` for reference reporting
+        - Minimum eccentricity is enforced as `Mmin = Pu x e_min`
+        - `e_min = 0.1D` for circular sections and `0.1 x min(b, h)` for square/rectangular sections in the current implementation
+        - If user-entered `Mx, My` are smaller than `Mmin`, the app scales the moment vector up to the minimum required magnitude before the PMM check
+        - The worst adjusted load case becomes the governing case for summary and auto design
         - The `Section` tab now shows:
           base reinforcement plot, uniaxial interaction curves with demand markers, `PMM Mux-My` slice at governing `Pu`, and a 3D interaction surface with the load point
 
+        **Required steel reporting**
+
+        - `Required Ast from PMM` is solved iteratively for the current layout pattern by increasing or reducing the equivalent total steel area until the governing PMM ratio reaches `1.0`
+        - This PMM-required steel value is an equivalent area for the current bar pattern and bar centroids
+        - `Axial starter Ast` remains visible as a quick screening value, but it is no longer the pass/fail criterion
+
         **Engineering note**
 
-        - This app is now much closer in behavior and presentation to your reference app, and the interaction plots now come from a true strain compatibility workflow for both rectangular and circular sections
-        - The 2D `PMM` slice and 3D surface in the `Section` tab are now built from true rotated-neutral-axis strain compatibility, while the auto-design screening and summary biaxial ratio still use the faster load contour approximation
+        - App status is now governed by spacing, steel ratio bounds, and true PMM utilization, instead of mixing axial-only and PMM-only criteria
+        - The summary governing ratio, the `Section` tab PMM slice, the 3D surface, and auto-design screening all use the same PMM engine
+        - `phi Pn` remains useful as a compression reference value, but it is no longer treated as a separate duplicate pass/fail gate
         - Final design should still verify the governing code, moment effects, slenderness, confinement, pile driving or precast detailing limits, splice/development, and project-specific requirements
         """
     )
