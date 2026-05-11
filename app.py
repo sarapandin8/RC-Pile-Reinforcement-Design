@@ -73,9 +73,24 @@ def effective_cover_mm(clear_cover_mm: float, tie_dia_mm: float, main_bar_dia_mm
     return clear_cover_mm + tie_dia_mm + 0.5 * main_bar_dia_mm
 
 
-def design_strength_kN(phi: float, fc_mpa: float, fy_mpa: float, ag_mm2: float, ast_mm2: float) -> float:
-    nominal_n = 0.85 * fc_mpa * (ag_mm2 - ast_mm2) + fy_mpa * ast_mm2
-    return phi * nominal_n / 1000.0
+def axial_cap_factor(column_type: str) -> float:
+    return 0.80 if column_type == "Tied" else 0.85
+
+
+def nominal_axial_strength_n(fc_mpa: float, fy_mpa: float, ag_mm2: float, ast_mm2: float) -> float:
+    return 0.85 * fc_mpa * (ag_mm2 - ast_mm2) + fy_mpa * ast_mm2
+
+
+def design_strength_kN(
+    phi: float,
+    fc_mpa: float,
+    fy_mpa: float,
+    ag_mm2: float,
+    ast_mm2: float,
+    axial_cap_factor_value: float = 1.0,
+) -> float:
+    nominal_n = nominal_axial_strength_n(fc_mpa, fy_mpa, ag_mm2, ast_mm2)
+    return axial_cap_factor_value * phi * nominal_n / 1000.0
 
 
 def default_load_cases() -> pd.DataFrame:
@@ -95,10 +110,12 @@ def required_steel_area_mm2(
     fy_mpa: float,
     ag_mm2: float,
     min_ratio: float,
+    axial_cap_factor_value: float = 1.0,
 ) -> tuple[float, float, float]:
     pu_n = pu_kN * 1000.0
     ast_min = min_ratio * ag_mm2
-    numerator = pu_n / phi - 0.85 * fc_mpa * ag_mm2
+    denominator_strength = axial_cap_factor_value * phi
+    numerator = pu_n / denominator_strength - 0.85 * fc_mpa * ag_mm2 if denominator_strength > 0 else float("inf")
     denominator = fy_mpa - 0.85 * fc_mpa
     ast_equation = numerator / denominator if denominator > 0 else 0.0
     ast_required = max(ast_min, ast_equation, 0.0)
@@ -142,8 +159,8 @@ def rectangular_spacing_check(
     if core_width <= 0 or core_depth <= 0:
         return False, "Cover, tie, and main bar consume the whole section."
 
-    width_clear = float("inf") if bars_width_face <= 1 else (core_width - bar_dia_mm) / (bars_width_face - 1) - bar_dia_mm
-    depth_clear = float("inf") if bars_depth_face <= 1 else (core_depth - bar_dia_mm) / (bars_depth_face - 1) - bar_dia_mm
+    width_clear = float("inf") if bars_width_face <= 1 else core_width / (bars_width_face - 1) - bar_dia_mm
+    depth_clear = float("inf") if bars_depth_face <= 1 else core_depth / (bars_depth_face - 1) - bar_dia_mm
     ok = width_clear >= min_clear_spacing_mm and depth_clear >= min_clear_spacing_mm
     return ok, f"clear spacing x = {width_clear:,.1f} mm, y = {depth_clear:,.1f} mm"
 
@@ -299,6 +316,7 @@ def interaction_curve(
     fc_mpa: float,
     fy_mpa: float,
     phi: float,
+    axial_cap_factor_value: float,
     axis: Literal["x", "y"],
     bars_width_face: int | None = None,
     bars_depth_face: int | None = None,
@@ -315,6 +333,7 @@ def interaction_curve(
         bars_circular=bars_circular,
     )
     bar_area_single = bar_area_mm2(bar_dia_mm)
+    total_ast_mm2 = len(coords) * bar_area_single
     depth = section_depth_along_axis(geometry, axis)
     c_values = [1.0, 5.0, 10.0]
     c_values.extend([depth * frac for frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]])
@@ -342,6 +361,15 @@ def interaction_curve(
         )
 
     df = pd.DataFrame([point.__dict__ for point in rows])
+    phi_pn_max_kN = design_strength_kN(
+        phi=phi,
+        fc_mpa=fc_mpa,
+        fy_mpa=fy_mpa,
+        ag_mm2=geometry.ag_mm2,
+        ast_mm2=total_ast_mm2,
+        axial_cap_factor_value=axial_cap_factor_value,
+    )
+    df["phi_pn_kN"] = df["phi_pn_kN"].clip(upper=phi_pn_max_kN)
     df = df.drop_duplicates(subset=["phi_mn_kNm", "phi_pn_kN"]).reset_index(drop=True)
     return df
 
@@ -418,6 +446,7 @@ def analyze_manual_layout(
     min_ratio: float,
     max_ratio: float,
     shape: Shape,
+    axial_cap_factor_value: float,
     governing_pu_kN: float,
     governing_case_name: str,
     governing_ratio: float,
@@ -428,7 +457,15 @@ def analyze_manual_layout(
     bars_circular: int | None = None,
 ) -> DesignResult:
     min_clear = minimum_clear_spacing_mm(bar_dia_mm, min_clear_spacing_user_mm)
-    ast_required, ast_equation, ast_min = required_steel_area_mm2(governing_pu_kN, phi, fc_mpa, fy_mpa, geometry.ag_mm2, min_ratio)
+    ast_required, ast_equation, ast_min = required_steel_area_mm2(
+        governing_pu_kN,
+        phi,
+        fc_mpa,
+        fy_mpa,
+        geometry.ag_mm2,
+        min_ratio,
+        axial_cap_factor_value,
+    )
     ast_max = max_ratio * geometry.ag_mm2
 
     if shape == "Circular":
@@ -458,7 +495,7 @@ def analyze_manual_layout(
         )
         eccentricity = 0.1 * min(float(geometry.width_mm), float(geometry.depth_mm))
 
-    phi_pn = design_strength_kN(phi, fc_mpa, fy_mpa, geometry.ag_mm2, ast)
+    phi_pn = design_strength_kN(phi, fc_mpa, fy_mpa, geometry.ag_mm2, ast, axial_cap_factor_value)
     overall_ok = spacing_ok and ast >= ast_required and ast <= ast_max and governing_ratio <= 1.0 and phi_pn >= governing_pu_kN
     return DesignResult(
         ast_required_mm2=ast_required,
@@ -492,14 +529,15 @@ def auto_design_options(
     bar_sizes_mm: list[float],
     load_df: pd.DataFrame,
     biaxial_alpha: float,
+    axial_cap_factor_value: float,
 ) -> pd.DataFrame:
     rows: list[dict] = []
 
     for dia in bar_sizes_mm:
         if shape == "Circular":
             for n_bars in range(6, 33):
-                curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, "x", bars_circular=n_bars)
-                curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, "y", bars_circular=n_bars)
+                curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "x", bars_circular=n_bars)
+                curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "y", bars_circular=n_bars)
                 _, governing = evaluate_load_cases(load_df, curve_x, curve_y, biaxial_alpha)
                 result = analyze_manual_layout(
                     geometry=geometry,
@@ -514,6 +552,7 @@ def auto_design_options(
                     min_ratio=min_ratio,
                     max_ratio=max_ratio,
                     shape=shape,
+                    axial_cap_factor_value=axial_cap_factor_value,
                     governing_pu_kN=governing["pu"],
                     governing_case_name=governing["case"],
                     governing_ratio=governing["ratio"],
@@ -542,8 +581,8 @@ def auto_design_options(
                     total = total_bars_rectangular(bx, by)
                     if total < 4:
                         continue
-                    curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, "x", bars_width_face=bx, bars_depth_face=by)
-                    curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, "y", bars_width_face=bx, bars_depth_face=by)
+                    curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "x", bars_width_face=bx, bars_depth_face=by)
+                    curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, axial_cap_factor_value, "y", bars_width_face=bx, bars_depth_face=by)
                     _, governing = evaluate_load_cases(load_df, curve_x, curve_y, biaxial_alpha)
                     result = analyze_manual_layout(
                         geometry=geometry,
@@ -558,6 +597,7 @@ def auto_design_options(
                         min_ratio=min_ratio,
                         max_ratio=max_ratio,
                         shape=shape,
+                        axial_cap_factor_value=axial_cap_factor_value,
                         governing_pu_kN=governing["pu"],
                         governing_case_name=governing["case"],
                         governing_ratio=governing["ratio"],
@@ -843,17 +883,16 @@ def pmm_surface_plot(
     for p_level in p_levels:
         mnx = moment_capacity_at_pu(curve_x, p_level)
         mny = moment_capacity_at_pu(curve_y, p_level)
+        if mnx <= 0.0 or mny <= 0.0:
+            continue
         row_x: list[float] = []
         row_y: list[float] = []
         row_z: list[float] = []
         for theta in theta_values:
             c = math.cos(theta)
             s = math.sin(theta)
-            if mnx <= 0.0 or mny <= 0.0:
-                radius = 0.0
-            else:
-                denominator = (abs(c) / mnx) ** alpha + (abs(s) / mny) ** alpha
-                radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
+            denominator = (abs(c) / mnx) ** alpha + (abs(s) / mny) ** alpha
+            radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
             row_x.append(radius * c)
             row_y.append(radius * s)
             row_z.append(p_level)
@@ -919,7 +958,7 @@ def pmm_surface_plot(
             "camera": {"eye": {"x": 1.6, "y": 1.4, "z": 1.2}},
         },
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
-        margin={"l": 0, "r": 0, "t": 50, "b": 0},
+        margin={"l": 10, "r": 10, "t": 60, "b": 10},
     )
     return fig
 
@@ -938,6 +977,24 @@ def clean_load_cases(df: pd.DataFrame) -> pd.DataFrame:
     if working.empty:
         working = default_load_cases()
     return working
+
+
+def parse_available_bar_sizes(text: str) -> list[float]:
+    parsed: list[float] = []
+    for raw_item in text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            value = float(item)
+        except ValueError:
+            st.warning(f"'{item}' is not a valid bar diameter and was skipped.")
+            continue
+        if value <= 0.0:
+            st.warning(f"'{item}' must be greater than 0 and was skipped.")
+            continue
+        parsed.append(value)
+    return sorted(set(parsed))
 
 
 def json_ready(value):
@@ -1054,16 +1111,11 @@ st.session_state.load_cases = load_cases_df.copy()
 
 geometry = section_geometry(shape, width_mm, depth_mm, diameter_mm)
 phi = phi_factor(column_type)
+axial_cap = axial_cap_factor(column_type)
 min_ratio = min_ratio_percent / 100.0
 max_ratio = max_ratio_percent / 100.0
 
-available_sizes = sorted(
-    {
-        float(item.strip())
-        for item in available_sizes_text.split(",")
-        if item.strip()
-    }
-)
+available_sizes = parse_available_bar_sizes(available_sizes_text)
 if not available_sizes:
     available_sizes = DEFAULT_BAR_SIZES_MM.copy()
 
@@ -1076,6 +1128,7 @@ curve_x_manual = interaction_curve(
     fc_mpa=fc_mpa,
     fy_mpa=fy_mpa,
     phi=phi,
+    axial_cap_factor_value=axial_cap,
     axis="x",
     bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
     bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
@@ -1090,6 +1143,7 @@ curve_y_manual = interaction_curve(
     fc_mpa=fc_mpa,
     fy_mpa=fy_mpa,
     phi=phi,
+    axial_cap_factor_value=axial_cap,
     axis="y",
     bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
     bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
@@ -1110,6 +1164,7 @@ manual_result = analyze_manual_layout(
     min_ratio=min_ratio,
     max_ratio=max_ratio,
     shape=shape,
+    axial_cap_factor_value=axial_cap,
     governing_pu_kN=governing_case["pu"],
     governing_case_name=governing_case["case"],
     governing_ratio=governing_case["ratio"],
@@ -1192,6 +1247,7 @@ if mode == "Auto design":
             bar_sizes_mm=available_sizes,
             load_df=load_cases_df,
             biaxial_alpha=biaxial_alpha,
+            axial_cap_factor_value=axial_cap,
         )
 else:
     options_df = pd.DataFrame()
@@ -1214,6 +1270,7 @@ with tabs[0]:
             ["phi Mnx at governing Pu", f"{manual_result.phi_mnx_at_pu_kNm:,.1f}", "kN-m"],
             ["phi Mny at governing Pu", f"{manual_result.phi_mny_at_pu_kNm:,.1f}", "kN-m"],
             ["phi Pn", f"{manual_result.phi_pn_kN:,.1f}", "kN"],
+            ["Axial cap factor", f"{axial_cap:.2f}", "ACI compression limit"],
             ["Pu governing", f"{governing_case['pu']:,.1f}", "kN"],
             ["Mx governing", f"{governing_case['mx']:,.1f}", "kN-m"],
             ["My governing", f"{governing_case['my']:,.1f}", "kN-m"],
@@ -1254,7 +1311,7 @@ with tabs[1]:
     )
     st.dataframe(min_check_df, use_container_width=True, hide_index=True)
     st.plotly_chart(pmm_slice_fig, use_container_width=True)
-    st.plotly_chart(pmm_surface_fig, use_container_width=True)
+    st.plotly_chart(pmm_surface_fig, use_container_width=True, key="pmm_3d_surface")
 
 with tabs[2]:
     left, right = st.columns(2)
@@ -1291,8 +1348,11 @@ with tabs[3]:
 
         - Simplified concentric compression check:
           `phi Pn = phi [0.85 f'c (Ag - Ast) + fy Ast]`
+        - ACI axial compression cap is applied in design strength:
+          `phi Pn,max = cap x phi x [0.85 f'c (Ag - Ast) + fy Ast]`
+        - `cap = 0.80` for tied columns and `0.85` for spiral columns in the current app
         - Required steel from governing axial load case:
-          `Ast = (Pu/phi - 0.85 f'c Ag) / (fy - 0.85 f'c)`
+          `Ast = (Pu/(cap x phi) - 0.85 f'c Ag) / (fy - 0.85 f'c)`
         - Adopted `Ast required = max(Ast from equation, Ast minimum, 0)`
         - Steel ratio limits:
           `rho_min = {min_ratio_percent:.2f}%`
@@ -1314,6 +1374,7 @@ with tabs[3]:
         - Steel stress is computed from strain using `Es = 200,000 MPa` and capped at `fy`
         - Bars inside the compression block use net steel stress `(fs - 0.85f'c)` to avoid double counting displaced concrete
         - Neutral axis depth is swept through multiple values to build the full interaction curve
+        - The compression end of the interaction curve is capped to the ACI axial compression limit for tied/spiral columns
 
         **Biaxial bending check**
 
