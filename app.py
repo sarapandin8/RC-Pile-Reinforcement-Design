@@ -594,6 +594,7 @@ def section_figure(
     cover_mm: float,
     tie_dia_mm: float,
     bar_dia_mm: float,
+    note_text: str = "",
     bars_width_face: int | None = None,
     bars_depth_face: int | None = None,
     bars_circular: int | None = None,
@@ -663,7 +664,7 @@ def section_figure(
         )
 
     fig.update_layout(
-        title="Section Layout",
+        title="Base section reinforcement",
         template="plotly_white",
         height=520,
         xaxis={"title": "x (mm)", "scaleanchor": "y", "range": [-limit, limit]},
@@ -671,6 +672,19 @@ def section_figure(
         legend={"orientation": "h"},
         margin={"l": 20, "r": 20, "t": 50, "b": 20},
     )
+    if note_text:
+        fig.add_annotation(
+            xref="paper",
+            yref="paper",
+            x=0.02,
+            y=0.98,
+            text=note_text,
+            showarrow=False,
+            align="left",
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="#cbd5e1",
+            borderwidth=1,
+        )
     return fig
 
 
@@ -690,6 +704,226 @@ def interaction_plot(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: float) -> go
     return fig
 
 
+def section_note_text(
+    shape: Shape,
+    bar_dia_mm: float,
+    total_bars: int,
+    ast_mm2: float,
+    rho_percent: float,
+    spacing_note: str,
+    bars_width_face: int | None = None,
+    bars_depth_face: int | None = None,
+    bars_circular: int | None = None,
+) -> str:
+    if shape == "Circular":
+        arrangement = f"{int(bars_circular or 0)} bars around perimeter"
+    else:
+        arrangement = f"Top/bottom: {int(bars_width_face or 0)} each, left/right: {int(bars_depth_face or 0)} each"
+    return (
+        f"{arrangement}<br>"
+        f"Main bars: DB{int(bar_dia_mm)} | total bars = {total_bars}<br>"
+        f"Ast = {ast_mm2:,.0f} mm2 | rho = {rho_percent:.3f}%<br>"
+        f"{spacing_note}"
+    )
+
+
+def interaction_plot_with_demand(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: float, mx_kNm: float, my_kNm: float) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_x["phi_mn_kNm"], y=df_x["phi_pn_kN"], mode="lines", name="about x", line={"color": "#2563eb", "width": 3}))
+    fig.add_trace(go.Scatter(x=df_y["phi_mn_kNm"], y=df_y["phi_pn_kN"], mode="lines", name="about y", line={"color": "#e11d48", "width": 3}))
+    fig.add_trace(
+        go.Scatter(
+            x=[abs(mx_kNm)],
+            y=[pu_kN],
+            mode="markers",
+            name="Pu, Mux",
+            marker={"symbol": "x", "size": 10, "color": "#2563eb", "line": {"width": 2}},
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[abs(my_kNm)],
+            y=[pu_kN],
+            mode="markers",
+            name="Pu, Muy",
+            marker={"symbol": "x", "size": 10, "color": "#e11d48", "line": {"width": 2}},
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=460,
+        title="Uniaxial interaction curves at base section",
+        xaxis_title="phi Mn (kN-m)",
+        yaxis_title="phi Pn (kN)",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
+        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+    )
+    return fig
+
+
+def pmm_slice_points(mnx_kNm: float, mny_kNm: float, alpha: float, point_count: int = 181) -> pd.DataFrame:
+    if mnx_kNm <= 0.0 or mny_kNm <= 0.0:
+        return pd.DataFrame(columns=["mx_kNm", "my_kNm"])
+    rows: list[dict[str, float]] = []
+    for i in range(point_count):
+        theta = 2.0 * math.pi * i / (point_count - 1)
+        c = math.cos(theta)
+        s = math.sin(theta)
+        denominator = (abs(c) / mnx_kNm) ** alpha + (abs(s) / mny_kNm) ** alpha
+        radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
+        rows.append({"mx_kNm": radius * c, "my_kNm": radius * s})
+    return pd.DataFrame(rows)
+
+
+def pmm_slice_plot(mnx_kNm: float, mny_kNm: float, pu_kN: float, mx_kNm: float, my_kNm: float, alpha: float, ratio: float) -> go.Figure:
+    contour = pmm_slice_points(mnx_kNm, mny_kNm, alpha)
+    fig = go.Figure()
+    if not contour.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=contour["mx_kNm"],
+                y=contour["my_kNm"],
+                mode="lines",
+                name="PMM slice",
+                line={"color": "#0284c7", "width": 2.5},
+                fill="toself",
+                fillcolor="rgba(2, 132, 199, 0.10)",
+            )
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=[0.0, mx_kNm],
+            y=[0.0, my_kNm],
+            mode="lines+markers",
+            name="demand",
+            line={"color": "#0f766e", "width": 2},
+            marker={"size": 6, "color": "#0f766e"},
+        )
+    )
+    fig.add_annotation(
+        x=mx_kNm,
+        y=my_kNm,
+        text=f"PMM U = {ratio:.3f}",
+        showarrow=True,
+        arrowhead=2,
+        ax=30,
+        ay=-20,
+    )
+    max_x = max(abs(mx_kNm), abs(contour["mx_kNm"]).max() if not contour.empty else 0.0, 1.0)
+    max_y = max(abs(my_kNm), abs(contour["my_kNm"]).max() if not contour.empty else 0.0, 1.0)
+    fig.update_layout(
+        template="plotly_white",
+        height=420,
+        title=f"PMM Mux-My slice at Pu = {pu_kN:,.0f} kN",
+        xaxis={"title": "Mux (kN-m)", "zeroline": True, "range": [-1.15 * max_x, 1.15 * max_x], "scaleanchor": "y"},
+        yaxis={"title": "Muy (kN-m)", "zeroline": True, "range": [-1.15 * max_y, 1.15 * max_y]},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
+        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+    )
+    return fig
+
+
+def pmm_surface_plot(
+    curve_x: pd.DataFrame,
+    curve_y: pd.DataFrame,
+    pu_kN: float,
+    mx_kNm: float,
+    my_kNm: float,
+    alpha: float,
+    ratio: float,
+) -> go.Figure:
+    p_max = max(0.0, min(float(curve_x["phi_pn_kN"].max()), float(curve_y["phi_pn_kN"].max())))
+    p_levels = [p_max * i / 24.0 for i in range(25)]
+    theta_values = [2.0 * math.pi * i / 48.0 for i in range(49)]
+
+    x_grid: list[list[float]] = []
+    y_grid: list[list[float]] = []
+    z_grid: list[list[float]] = []
+
+    for p_level in p_levels:
+        mnx = moment_capacity_at_pu(curve_x, p_level)
+        mny = moment_capacity_at_pu(curve_y, p_level)
+        row_x: list[float] = []
+        row_y: list[float] = []
+        row_z: list[float] = []
+        for theta in theta_values:
+            c = math.cos(theta)
+            s = math.sin(theta)
+            if mnx <= 0.0 or mny <= 0.0:
+                radius = 0.0
+            else:
+                denominator = (abs(c) / mnx) ** alpha + (abs(s) / mny) ** alpha
+                radius = 0.0 if denominator <= 0.0 else denominator ** (-1.0 / alpha)
+            row_x.append(radius * c)
+            row_y.append(radius * s)
+            row_z.append(p_level)
+        x_grid.append(row_x)
+        y_grid.append(row_y)
+        z_grid.append(row_z)
+
+    current_slice = pmm_slice_points(moment_capacity_at_pu(curve_x, pu_kN), moment_capacity_at_pu(curve_y, pu_kN), alpha)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Surface(
+            x=x_grid,
+            y=y_grid,
+            z=z_grid,
+            showscale=False,
+            opacity=0.62,
+            colorscale=[[0.0, "#bfdbfe"], [1.0, "#60a5fa"]],
+            name="PMM surface",
+            hovertemplate="Mux=%{x:.1f}<br>Muy=%{y:.1f}<br>Pu=%{z:.1f}<extra></extra>",
+        )
+    )
+    if not current_slice.empty:
+        fig.add_trace(
+            go.Scatter3d(
+                x=current_slice["mx_kNm"],
+                y=current_slice["my_kNm"],
+                z=[pu_kN] * len(current_slice),
+                mode="lines",
+                name="current Pu slice",
+                line={"color": "#0284c7", "width": 5},
+            )
+        )
+    fig.add_trace(
+        go.Scatter3d(
+            x=[0.0, mx_kNm],
+            y=[0.0, my_kNm],
+            z=[0.0, pu_kN],
+            mode="lines",
+            name="demand vector",
+            line={"color": "#0f766e", "width": 6},
+        )
+    )
+    fig.add_trace(
+        go.Scatter3d(
+            x=[mx_kNm],
+            y=[my_kNm],
+            z=[pu_kN],
+            mode="markers+text",
+            name="load point",
+            marker={"size": 5, "color": "#115e59"},
+            text=[f"U={ratio:.3f}"],
+            textposition="top center",
+        )
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=520,
+        title="3D PMM interaction surface with load point",
+        scene={
+            "xaxis_title": "Mux (kN-m)",
+            "yaxis_title": "Muy (kN-m)",
+            "zaxis_title": "Pu (kN)",
+            "camera": {"eye": {"x": 1.6, "y": 1.4, "z": 1.2}},
+        },
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
+        margin={"l": 0, "r": 0, "t": 50, "b": 0},
+    )
+    return fig
+
+
 def clean_load_cases(df: pd.DataFrame) -> pd.DataFrame:
     required_cols = ["Case", "Pu (kN)", "Mx (kN-m)", "My (kN-m)"]
     working = df.copy()
@@ -706,8 +940,14 @@ def clean_load_cases(df: pd.DataFrame) -> pd.DataFrame:
     return working
 
 
+def json_ready(value):
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict(orient="records")
+    return value
+
+
 def project_payload(data: dict) -> str:
-    return json.dumps(data, indent=2)
+    return json.dumps({key: json_ready(value) for key, value in data.items()}, indent=2)
 
 
 st.set_page_config(page_title="Pile Reinforcement Designer", page_icon="P", layout="wide", initial_sidebar_state="expanded")
@@ -737,6 +977,7 @@ with st.sidebar:
         "bars_depth_face": 4,
         "bars_circular": 8,
         "available_sizes_text": "12, 16, 20, 25, 28, 32",
+        "load_cases": default_load_cases().to_dict(orient="records"),
     }
     payload = project_payload({key: st.session_state.get(key, value) for key, value in default_state.items()})
     st.download_button("Download project JSON", payload, file_name="pile_rebar_design.json", mime="application/json", use_container_width=True)
@@ -884,6 +1125,48 @@ if shape == "Circular":
 else:
     total_bars = total_bars_rectangular(int(bars_width_face), int(bars_depth_face))
 ast_manual = total_bars * bar_area_mm2(float(manual_bar_dia_mm))
+section_note = section_note_text(
+    shape=shape,
+    bar_dia_mm=float(manual_bar_dia_mm),
+    total_bars=total_bars,
+    ast_mm2=ast_manual,
+    rho_percent=manual_result.steel_ratio_percent,
+    spacing_note=manual_result.spacing_note,
+    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
+    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
+    bars_circular=int(bars_circular) if bars_circular is not None else None,
+)
+
+section_layout_fig = section_figure(
+    geometry=geometry,
+    shape=shape,
+    cover_mm=cover_mm,
+    tie_dia_mm=tie_dia_mm,
+    bar_dia_mm=float(manual_bar_dia_mm),
+    note_text=section_note,
+    bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
+    bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
+    bars_circular=int(bars_circular) if bars_circular is not None else None,
+)
+uniaxial_fig = interaction_plot_with_demand(curve_x_manual, curve_y_manual, governing_case["pu"], governing_case["mx"], governing_case["my"])
+pmm_slice_fig = pmm_slice_plot(
+    mnx_kNm=manual_result.phi_mnx_at_pu_kNm,
+    mny_kNm=manual_result.phi_mny_at_pu_kNm,
+    pu_kN=governing_case["pu"],
+    mx_kNm=governing_case["mx"],
+    my_kNm=governing_case["my"],
+    alpha=biaxial_alpha,
+    ratio=manual_result.governing_ratio,
+)
+pmm_surface_fig = pmm_surface_plot(
+    curve_x=curve_x_manual,
+    curve_y=curve_y_manual,
+    pu_kN=governing_case["pu"],
+    mx_kNm=governing_case["mx"],
+    my_kNm=governing_case["my"],
+    alpha=biaxial_alpha,
+    ratio=manual_result.governing_ratio,
+)
 
 result_cols = st.columns(6)
 result_cols[0].metric("Gross area Ag", f"{geometry.ag_mm2:,.0f} mm2")
@@ -954,20 +1237,24 @@ with tabs[0]:
             )
 
 with tabs[1]:
-    st.plotly_chart(
-        section_figure(
-            geometry=geometry,
-            shape=shape,
-            cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=float(manual_bar_dia_mm),
-            bars_width_face=int(bars_width_face) if bars_width_face is not None else None,
-            bars_depth_face=int(bars_depth_face) if bars_depth_face is not None else None,
-            bars_circular=int(bars_circular) if bars_circular is not None else None,
-        ),
-        use_container_width=True,
+    top_left, top_right = st.columns(2)
+    with top_left:
+        st.plotly_chart(section_layout_fig, use_container_width=True)
+    with top_right:
+        st.plotly_chart(uniaxial_fig, use_container_width=True)
+
+    st.subheader("Minimum Reinforcement Check")
+    min_check_df = pd.DataFrame(
+        [
+            ["Minimum Ast required", f"{manual_result.ast_min_mm2:,.1f} mm2", "From minimum rho setting"],
+            ["Provided Ast", f"{ast_manual:,.1f} mm2", "Current layout"],
+            ["Overall status", "OK" if ast_manual >= manual_result.ast_min_mm2 else "NG", "Minimum reinforcement check"],
+        ],
+        columns=["Check", "Value", "Note"],
     )
-    st.caption("The plot mirrors the reference app style by showing section outline, tie line, and actual main-bar placement.")
+    st.dataframe(min_check_df, use_container_width=True, hide_index=True)
+    st.plotly_chart(pmm_slice_fig, use_container_width=True)
+    st.plotly_chart(pmm_surface_fig, use_container_width=True)
 
 with tabs[2]:
     left, right = st.columns(2)
@@ -1036,10 +1323,13 @@ with tabs[3]:
           `(Mx / phi Mnx)^alpha + (My / phi Mny)^alpha <= 1.0`
         - `alpha = {biaxial_alpha:.2f}` in the current run
         - The worst load case becomes the governing case for the manual summary and for auto design filtering
+        - The `Section` tab now shows:
+          base reinforcement plot, uniaxial interaction curves with demand markers, `PMM Mux-My` slice at governing `Pu`, and a 3D interaction surface with the load point
 
         **Engineering note**
 
         - This app is now much closer in behavior and presentation to your reference app, and the interaction plots now come from a true strain compatibility workflow for both rectangular and circular sections
+        - The 2D `PMM` slice and 3D surface are built from the uniaxial strain-compatibility capacities plus the selected biaxial load contour exponent `alpha`
         - Final design should still verify the governing code, moment effects, slenderness, confinement, pile driving or precast detailing limits, splice/development, and project-specific requirements
         """
     )
