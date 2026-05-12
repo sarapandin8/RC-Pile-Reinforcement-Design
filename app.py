@@ -551,14 +551,26 @@ st.markdown(
     div[data-testid="stTabs"] div[data-baseweb="tab-list"] {
         gap: 0.35rem;
         flex-wrap: wrap;
+        overflow-x: auto;
+        overflow-y: visible;
         border-bottom: 2px solid #cbd5e1;
         padding: 0.25rem 0 0.45rem 0;
         margin-bottom: 0.75rem;
     }
 
+    div[data-testid="stTabs"] div[role="tablist"] {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        overflow-x: auto;
+        overflow-y: visible;
+        padding-bottom: 0.45rem;
+    }
+
     div[data-testid="stTabs"] button[data-baseweb="tab"] {
         height: 2.65rem;
-        padding: 0 0.95rem;
+        padding: 0 0.72rem;
+        flex: 0 0 auto;
         border: 1px solid #d7dee8;
         border-bottom-color: #cbd5e1;
         border-radius: 8px 8px 0 0;
@@ -570,10 +582,14 @@ st.markdown(
     }
 
     div[data-testid="stTabs"] button[data-baseweb="tab"] p {
-        font-size: 0.96rem;
+        font-size: 0.92rem;
         font-weight: 650;
         line-height: 1.1;
         white-space: nowrap;
+    }
+
+    div[data-testid="stTabs"] button[role="tab"] {
+        flex: 0 0 auto;
     }
 
     div[data-testid="stTabs"] button[data-baseweb="tab"]:hover {
@@ -1220,7 +1236,7 @@ if "_stm_results" in st.session_state:
     t1, t2, t6, t3, t7, t4, t5, t8 = st.tabs([
         "📊 Plan", "📈 Elevation", "🎲 3D View",
         "🔩 Bottom Rebar", "🪟 Top Rebar",
-        "⚓ Anchorage", "📋 Detail", "🧱 Pile Head Forces"])
+        "⚓ Anchorage", "📋 Detail", "🧱 Pile Forces"])
 
     with t1:
         st.plotly_chart(
