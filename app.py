@@ -1328,11 +1328,11 @@ def pmm_slice_plot(contour_df: pd.DataFrame, pu_kN: float, mx_kNm: float, my_kNm
     fig.update_layout(
         template="plotly_white",
         height=420,
-        title=f"PMM Mux-My slice at Pu = {pu_kN:,.0f} kN",
+        title={"text": f"PMM Mux-My Slice at Pu = {pu_kN:,.0f} kN", "y": 0.97},
         xaxis={"title": "Mux (kN-m)", "zeroline": True, "range": [-1.15 * max_x, 1.15 * max_x], "scaleanchor": "y"},
         yaxis={"title": "Muy (kN-m)", "zeroline": True, "range": [-1.15 * max_y, 1.15 * max_y]},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
-        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.05, "x": 0.0},
+        margin={"l": 20, "r": 20, "t": 85, "b": 20},
     )
     return fig
 
@@ -1412,15 +1412,15 @@ def pmm_surface_plot(
     fig.update_layout(
         template="plotly_white",
         height=520,
-        title="3D PMM interaction surface with load point",
+        title={"text": "3D PMM Interaction Surface with Load Point", "y": 0.97},
         scene={
             "xaxis_title": "Mux (kN-m)",
             "yaxis_title": "Muy (kN-m)",
             "zaxis_title": "Pu (kN)",
             "camera": {"eye": {"x": 1.6, "y": 1.4, "z": 1.2}},
         },
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
-        margin={"l": 10, "r": 10, "t": 60, "b": 10},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.05, "x": 0.0},
+        margin={"l": 10, "r": 10, "t": 85, "b": 10},
     )
     return fig
 
