@@ -1,1989 +1,1890 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
 import json
+import importlib
 import math
-from typing import Literal
-
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-
-
-Shape = Literal["Square", "Rectangle", "Circular"]
-
-DEFAULT_BAR_SIZES_MM = [12.0, 16.0, 20.0, 25.0, 28.0, 32.0]
-
-
-@dataclass(frozen=True)
-class SectionGeometry:
-    shape: Shape
-    ag_mm2: float
-    width_mm: float | None = None
-    depth_mm: float | None = None
-    diameter_mm: float | None = None
-
-
-@dataclass(frozen=True)
-class DesignResult:
-    ast_required_mm2: float
-    ast_axial_starter_mm2: float
-    ast_from_equation_mm2: float
-    ast_min_mm2: float
-    ast_max_mm2: float
-    phi_pn_kN: float
-    steel_ratio_percent: float
-    spacing_ok: bool
-    spacing_note: str
-    overall_ok: bool
-    minimum_eccentricity_mm: float
-    governing_ratio: float = 0.0
-    governing_load_case: str = ""
-    phi_mnx_at_pu_kNm: float = 0.0
-    phi_mny_at_pu_kNm: float = 0.0
-    pmm_required_found: bool = False
-
-
-@dataclass(frozen=True)
-class InteractionPoint:
-    phi_pn_kN: float
-    phi_mn_kNm: float
-    neutral_axis_mm: float
-    max_tension_strain: float
-
-
-def bar_area_mm2(diameter_mm: float) -> float:
-    return math.pi * diameter_mm**2 / 4.0
-
-
-def phi_factor(column_type: str) -> float:
-    return 0.65 if column_type == "Tied" else 0.75
-
-
-def strain_based_phi(column_type: str, fy_mpa: float, tensile_strain: float, es_mpa: float = 200000.0) -> float:
-    phi_compression = phi_factor(column_type)
-    phi_tension = 0.90
-    epsilon_y = fy_mpa / es_mpa
-    if tensile_strain <= epsilon_y:
-        return phi_compression
-    if tensile_strain >= 0.005:
-        return phi_tension
-    transition = (tensile_strain - epsilon_y) / (0.005 - epsilon_y) if 0.005 > epsilon_y else 1.0
-    transition = max(0.0, min(1.0, transition))
-    return phi_compression + transition * (phi_tension - phi_compression)
-
-
-def section_geometry(shape: Shape, width_mm: float | None, depth_mm: float | None, diameter_mm: float | None) -> SectionGeometry:
-    if shape == "Square":
-        ag = float(width_mm) * float(width_mm)
-        return SectionGeometry(shape=shape, ag_mm2=ag, width_mm=float(width_mm), depth_mm=float(width_mm))
-    if shape == "Rectangle":
-        ag = float(width_mm) * float(depth_mm)
-        return SectionGeometry(shape=shape, ag_mm2=ag, width_mm=float(width_mm), depth_mm=float(depth_mm))
-    ag = math.pi * float(diameter_mm) ** 2 / 4.0
-    return SectionGeometry(shape=shape, ag_mm2=ag, diameter_mm=float(diameter_mm))
-
-
-def effective_cover_mm(clear_cover_mm: float, tie_dia_mm: float, main_bar_dia_mm: float) -> float:
-    return clear_cover_mm + tie_dia_mm + 0.5 * main_bar_dia_mm
-
-
-def axial_cap_factor(column_type: str) -> float:
-    return 0.80 if column_type == "Tied" else 0.85
-
-
-def nominal_axial_strength_n(fc_mpa: float, fy_mpa: float, ag_mm2: float, ast_mm2: float) -> float:
-    return 0.85 * fc_mpa * (ag_mm2 - ast_mm2) + fy_mpa * ast_mm2
-
-
-def design_strength_kN(
-    phi: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    ag_mm2: float,
-    ast_mm2: float,
-    axial_cap_factor_value: float = 1.0,
-) -> float:
-    nominal_n = nominal_axial_strength_n(fc_mpa, fy_mpa, ag_mm2, ast_mm2)
-    return axial_cap_factor_value * phi * nominal_n / 1000.0
-
-
-def default_load_cases() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {"Case": "LC1", "Pu (kN)": 1200.0, "Mx (kN-m)": 0.0, "My (kN-m)": 0.0},
-            {"Case": "LC2", "Pu (kN)": 1000.0, "Mx (kN-m)": 60.0, "My (kN-m)": 40.0},
-            {"Case": "LC3", "Pu (kN)": 900.0, "Mx (kN-m)": 90.0, "My (kN-m)": 55.0},
-        ]
-    )
-
-
-def required_steel_area_mm2(
-    pu_kN: float,
-    phi: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    ag_mm2: float,
-    min_ratio: float,
-    axial_cap_factor_value: float = 1.0,
-) -> tuple[float, float, float]:
-    pu_n = pu_kN * 1000.0
-    ast_min = min_ratio * ag_mm2
-    denominator_strength = axial_cap_factor_value * phi
-    numerator = pu_n / denominator_strength - 0.85 * fc_mpa * ag_mm2 if denominator_strength > 0 else float("inf")
-    denominator = fy_mpa - 0.85 * fc_mpa
-    ast_equation = numerator / denominator if denominator > 0 else 0.0
-    ast_required = max(ast_min, ast_equation, 0.0)
-    return ast_required, ast_equation, ast_min
-
-
-def minimum_eccentricity_mm(geometry: SectionGeometry) -> float:
-    if geometry.shape == "Circular":
-        return 0.1 * float(geometry.diameter_mm)
-    return 0.1 * min(float(geometry.width_mm), float(geometry.depth_mm))
-
-
-def minimum_moment_kNm(pu_kN: float, eccentricity_mm: float) -> float:
-    if pu_kN <= 0.0 or eccentricity_mm <= 0.0:
-        return 0.0
-    return pu_kN * eccentricity_mm / 1000.0
-
-
-def enforce_minimum_eccentricity(
-    pu_kN: float,
-    mx_kNm: float,
-    my_kNm: float,
-    eccentricity_mm: float,
-    mnx_kNm: float,
-    mny_kNm: float,
-) -> tuple[float, float, float, bool]:
-    m_min_kNm = minimum_moment_kNm(pu_kN, eccentricity_mm)
-    resultant = math.hypot(mx_kNm, my_kNm)
-    if m_min_kNm <= 0.0 or resultant >= m_min_kNm:
-        return mx_kNm, my_kNm, m_min_kNm, False
-    if resultant > 1e-9:
-        scale = m_min_kNm / resultant
-        return mx_kNm * scale, my_kNm * scale, m_min_kNm, True
-    if mnx_kNm <= mny_kNm:
-        return m_min_kNm, 0.0, m_min_kNm, True
-    return 0.0, m_min_kNm, m_min_kNm, True
-
-
-def layout_total_bars(
-    shape: Shape,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> int:
-    if shape == "Circular":
-        return int(bars_circular or 0)
-    return total_bars_rectangular(int(bars_width_face or 0), int(bars_depth_face or 0))
-
-
-def format_required_ast(ast_required_mm2: float, found: bool, ast_max_mm2: float) -> str:
-    if found and math.isfinite(ast_required_mm2):
-        return f"{ast_required_mm2:,.1f} mm2"
-    return f"> {ast_max_mm2:,.1f} mm2"
-
-
-def minimum_clear_spacing_mm(bar_dia_mm: float, user_min_clear_spacing_mm: float) -> float:
-    return max(user_min_clear_spacing_mm, 1.5 * bar_dia_mm, 40.0)
-
-
-def circular_spacing_check(
-    diameter_mm: float,
-    clear_cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    n_bars: int,
-    min_clear_spacing_mm: float,
-) -> tuple[bool, str]:
-    core_dia = diameter_mm - 2.0 * effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    if core_dia <= 0:
-        return False, "Cover, tie, and main bar consume the whole section."
-    circumference = math.pi * core_dia
-    center_spacing = circumference / n_bars
-    clear_spacing = center_spacing - bar_dia_mm
-    ok = clear_spacing >= min_clear_spacing_mm
-    return ok, f"clear spacing = {clear_spacing:,.1f} mm"
-
-
-def rectangular_spacing_check(
-    width_mm: float,
-    depth_mm: float,
-    clear_cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    bars_width_face: int,
-    bars_depth_face: int,
-    min_clear_spacing_mm: float,
-) -> tuple[bool, str]:
-    core_width = width_mm - 2.0 * effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    core_depth = depth_mm - 2.0 * effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    if core_width <= 0 or core_depth <= 0:
-        return False, "Cover, tie, and main bar consume the whole section."
-
-    width_clear = float("inf") if bars_width_face <= 1 else core_width / (bars_width_face - 1) - bar_dia_mm
-    depth_clear = float("inf") if bars_depth_face <= 1 else core_depth / (bars_depth_face - 1) - bar_dia_mm
-    ok = width_clear >= min_clear_spacing_mm and depth_clear >= min_clear_spacing_mm
-    return ok, f"clear spacing x = {width_clear:,.1f} mm, y = {depth_clear:,.1f} mm"
-
-
-def total_bars_rectangular(bars_width_face: int, bars_depth_face: int) -> int:
-    if bars_width_face < 2 or bars_depth_face < 2:
-        return 0
-    return 2 * bars_width_face + 2 * max(0, bars_depth_face - 2)
-
-
-def rectangular_bar_coordinates(
-    width_mm: float,
-    depth_mm: float,
-    clear_cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    bars_width_face: int,
-    bars_depth_face: int,
-) -> list[tuple[float, float]]:
-    x_edge = width_mm / 2.0 - effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    y_edge = depth_mm / 2.0 - effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    xs = [0.0] if bars_width_face == 1 else [(-x_edge + i * (2.0 * x_edge / (bars_width_face - 1))) for i in range(bars_width_face)]
-    ys = [0.0] if bars_depth_face == 1 else [(-y_edge + i * (2.0 * y_edge / (bars_depth_face - 1))) for i in range(bars_depth_face)]
-
-    coords: list[tuple[float, float]] = []
-    for x in xs:
-        coords.append((x, y_edge))
-        coords.append((x, -y_edge))
-    for y in ys[1:-1]:
-        coords.append((x_edge, y))
-        coords.append((-x_edge, y))
-    return coords
-
-
-def circular_bar_coordinates(
-    diameter_mm: float,
-    clear_cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    n_bars: int,
-) -> list[tuple[float, float]]:
-    radius = diameter_mm / 2.0 - effective_cover_mm(clear_cover_mm, tie_dia_mm, bar_dia_mm)
-    return [
-        (radius * math.cos(2.0 * math.pi * i / n_bars), radius * math.sin(2.0 * math.pi * i / n_bars))
-        for i in range(n_bars)
-    ]
-
-
-def beta1_aci(fc_mpa: float) -> float:
-    return max(0.65, min(0.85, 0.85 - 0.05 * max(fc_mpa - 28.0, 0.0) / 7.0))
-
-
-def section_bar_coordinates(
-    geometry: SectionGeometry,
-    shape: Shape,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> list[tuple[float, float]]:
-    if shape == "Circular":
-        return circular_bar_coordinates(float(geometry.diameter_mm), cover_mm, tie_dia_mm, bar_dia_mm, int(bars_circular or 0))
-    return rectangular_bar_coordinates(
-        float(geometry.width_mm),
-        float(geometry.depth_mm),
-        cover_mm,
-        tie_dia_mm,
-        bar_dia_mm,
-        int(bars_width_face or 0),
-        int(bars_depth_face or 0),
-    )
-
-
-def section_depth_along_axis(geometry: SectionGeometry, axis: Literal["x", "y"]) -> float:
-    if geometry.shape == "Circular":
-        return float(geometry.diameter_mm)
-    return float(geometry.depth_mm) if axis == "x" else float(geometry.width_mm)
-
-
-def section_width_at_coordinate(geometry: SectionGeometry, axis: Literal["x", "y"], coord_mm: float) -> float:
-    if geometry.shape == "Circular":
-        radius = float(geometry.diameter_mm) / 2.0
-        if abs(coord_mm) >= radius:
-            return 0.0
-        return 2.0 * math.sqrt(radius**2 - coord_mm**2)
-    if axis == "x":
-        return float(geometry.width_mm)
-    return float(geometry.depth_mm)
-
-
-def steel_stress_mpa(strain: float, fy_mpa: float, es_mpa: float = 200000.0) -> float:
-    return max(-fy_mpa, min(fy_mpa, es_mpa * strain))
-
-
-def section_response(
-    geometry: SectionGeometry,
-    axis: Literal["x", "y"],
-    neutral_axis_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    bar_area_single_mm2: float,
-    bar_coords: list[tuple[float, float]],
-) -> tuple[float, float, float]:
-    eps_cu = 0.003
-    beta1 = beta1_aci(fc_mpa)
-    depth = section_depth_along_axis(geometry, axis)
-    half_depth = depth / 2.0
-    a_depth = min(beta1 * neutral_axis_mm, depth)
-    compression_depth = min(a_depth, depth)
-
-    strip_count = 240
-    strip_thickness = compression_depth / strip_count if compression_depth > 0 else 0.0
-    concrete_force_n = 0.0
-    concrete_moment_nmm = 0.0
-
-    for i in range(strip_count):
-        top_face_coord = half_depth - (i + 0.5) * strip_thickness
-        strip_width = section_width_at_coordinate(geometry, axis, top_face_coord)
-        strip_area = strip_width * strip_thickness
-        strip_force = 0.85 * fc_mpa * strip_area
-        concrete_force_n += strip_force
-        concrete_moment_nmm += strip_force * top_face_coord
-
-    steel_force_n = 0.0
-    steel_moment_nmm = 0.0
-    max_tension_strain = 0.0
-    block_limit = half_depth - compression_depth
-
-    for x, y in bar_coords:
-        coord = y if axis == "x" else x
-        dist_from_top = half_depth - coord
-        strain = eps_cu * (1.0 - dist_from_top / neutral_axis_mm)
-        max_tension_strain = max(max_tension_strain, -strain)
-        stress = steel_stress_mpa(strain, fy_mpa)
-        in_compression_block = coord >= block_limit
-        steel_force = bar_area_single_mm2 * (stress - 0.85 * fc_mpa) if in_compression_block else bar_area_single_mm2 * stress
-        steel_force_n += steel_force
-        steel_moment_nmm += steel_force * coord
-
-    nominal_p_n = concrete_force_n + steel_force_n
-    nominal_m_nmm = concrete_moment_nmm + steel_moment_nmm
-    return nominal_p_n, nominal_m_nmm, max_tension_strain
-
-
-def interaction_curve(
-    geometry: SectionGeometry,
-    shape: Shape,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    phi: float,
-    column_type: str,
-    axial_cap_factor_value: float,
-    axis: Literal["x", "y"],
-    bar_area_single_override_mm2: float | None = None,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> pd.DataFrame:
-    coords = section_bar_coordinates(
-        geometry=geometry,
-        shape=shape,
-        cover_mm=cover_mm,
-        tie_dia_mm=tie_dia_mm,
-        bar_dia_mm=bar_dia_mm,
-        bars_width_face=bars_width_face,
-        bars_depth_face=bars_depth_face,
-        bars_circular=bars_circular,
-    )
-    bar_area_single = bar_area_single_override_mm2 if bar_area_single_override_mm2 is not None else bar_area_mm2(bar_dia_mm)
-    total_ast_mm2 = len(coords) * bar_area_single
-    depth = section_depth_along_axis(geometry, axis)
-    c_values = [1.0, 5.0, 10.0]
-    c_values.extend([depth * frac for frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]])
-    c_values.extend([depth + extra for extra in [100.0, 200.0, 400.0, 800.0, 1200.0, 2000.0, 4000.0]])
-    unique_c = sorted({round(max(1.0, c), 6) for c in c_values})
-
-    rows: list[InteractionPoint] = []
-    for c in unique_c:
-        nominal_p_n, nominal_m_nmm, max_tension_strain = section_response(
-            geometry=geometry,
-            axis=axis,
-            neutral_axis_mm=c,
-            fc_mpa=fc_mpa,
-            fy_mpa=fy_mpa,
-            bar_area_single_mm2=bar_area_single,
-            bar_coords=coords,
-        )
-        rows.append(
-            InteractionPoint(
-                phi_pn_kN=strain_based_phi(column_type, fy_mpa, max_tension_strain) * nominal_p_n / 1000.0,
-                phi_mn_kNm=strain_based_phi(column_type, fy_mpa, max_tension_strain) * abs(nominal_m_nmm) / 1_000_000.0,
-                neutral_axis_mm=c,
-                max_tension_strain=max_tension_strain,
-            )
-        )
-
-    df = pd.DataFrame([point.__dict__ for point in rows])
-    phi_pn_max_kN = design_strength_kN(
-        phi=phi,
-        fc_mpa=fc_mpa,
-        fy_mpa=fy_mpa,
-        ag_mm2=geometry.ag_mm2,
-        ast_mm2=total_ast_mm2,
-        axial_cap_factor_value=axial_cap_factor_value,
-    )
-    df["phi_pn_kN"] = df["phi_pn_kN"].clip(upper=phi_pn_max_kN)
-    df = df.drop_duplicates(subset=["phi_mn_kNm", "phi_pn_kN"]).reset_index(drop=True)
-    return df
-
-
-def moment_capacity_at_pu(curve_df: pd.DataFrame, pu_kN: float) -> float:
-    if curve_df.empty:
-        return 0.0
-    rows = curve_df.sort_values(by="phi_pn_kN", ascending=False).reset_index(drop=True)
-    points = list(zip(rows["phi_pn_kN"], rows["phi_mn_kNm"]))
-    moments: list[float] = []
-
-    for i in range(len(points) - 1):
-        p1, m1 = points[i]
-        p2, m2 = points[i + 1]
-        if (p1 >= pu_kN >= p2) or (p2 >= pu_kN >= p1):
-            if abs(p2 - p1) < 1e-9:
-                moments.append(max(m1, m2))
-            else:
-                ratio = (pu_kN - p1) / (p2 - p1)
-                moments.append(m1 + ratio * (m2 - m1))
-
-    moments.extend(m for p, m in points if p >= pu_kN)
-    if not moments:
-        return 0.0
-    return max(0.0, max(moments))
-
-
-def evaluate_load_cases_true(
-    load_df: pd.DataFrame,
-    curve_x: pd.DataFrame,
-    curve_y: pd.DataFrame,
-    pmm_responses: list[dict],
-    eccentricity_mm: float,
-) -> tuple[pd.DataFrame, dict]:
-    rows: list[dict] = []
-    governing: dict | None = None
-
-    for _, row in load_df.iterrows():
-        case = str(row["Case"])
-        pu = float(row["Pu (kN)"])
-        mx_input = float(row["Mx (kN-m)"])
-        my_input = float(row["My (kN-m)"])
-        mnx = moment_capacity_at_pu(curve_x, pu)
-        mny = moment_capacity_at_pu(curve_y, pu)
-        mx, my, m_min, min_ecc_applied = enforce_minimum_eccentricity(pu, mx_input, my_input, eccentricity_mm, mnx, mny)
-        contour = pmm_slice_from_responses(pmm_responses, pu)
-        ratio = ray_polygon_utilization(contour, mx, my)
-        status = "OK" if ratio <= 1.0 else "NG"
-        item = {
-            "Case": case,
-            "Pu (kN)": round(pu, 1),
-            "Mx input (kN-m)": round(mx_input, 1),
-            "My input (kN-m)": round(my_input, 1),
-            "Mx used (kN-m)": round(mx, 1),
-            "My used (kN-m)": round(my, 1),
-            "Mmin from e_min (kN-m)": round(m_min, 1),
-            "Min ecc applied": "Yes" if min_ecc_applied else "No",
-            "phi Mnx at Pu (kN-m)": round(mnx, 1),
-            "phi Mny at Pu (kN-m)": round(mny, 1),
-            "PMM ratio": round(ratio, 3) if math.isfinite(ratio) else None,
-            "Status": status,
-        }
-        rows.append(item)
-        if governing is None or ratio > governing["ratio"]:
-            governing = {
-                "case": case,
-                "ratio": ratio,
-                "mnx": mnx,
-                "mny": mny,
-                "pu": pu,
-                "mx": mx,
-                "my": my,
-                "mx_input": mx_input,
-                "my_input": my_input,
-                "m_min": m_min,
-                "min_ecc_applied": min_ecc_applied,
-                "contour": contour,
-            }
-
-    return pd.DataFrame(rows), (
-        governing
-        or {
-            "case": "",
-            "ratio": 0.0,
-            "mnx": 0.0,
-            "mny": 0.0,
-            "pu": 0.0,
-            "mx": 0.0,
-            "my": 0.0,
-            "mx_input": 0.0,
-            "my_input": 0.0,
-            "m_min": 0.0,
-            "min_ecc_applied": False,
-            "contour": pd.DataFrame(),
-        }
-    )
-
-
-@st.cache_data(show_spinner=False)
-def solve_required_ast_from_pmm(
-    geometry: SectionGeometry,
-    shape: Shape,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    phi: float,
-    column_type: str,
-    axial_cap_factor_value: float,
-    min_ratio: float,
-    max_ratio: float,
-    load_df: pd.DataFrame,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> tuple[float, bool]:
-    total_bars = layout_total_bars(shape, bars_width_face, bars_depth_face, bars_circular)
-    if total_bars <= 0:
-        return float("nan"), False
-
-    ast_min = min_ratio * geometry.ag_mm2
-    ast_max = max_ratio * geometry.ag_mm2
-    current_ast = total_bars * bar_area_mm2(bar_dia_mm)
-    eccentricity_value = minimum_eccentricity_mm(geometry)
-
-    def governing_ratio_for_ast(total_ast_mm2: float) -> float:
-        bar_area_single = total_ast_mm2 / total_bars
-        curve_x = interaction_curve(
-            geometry=geometry,
-            shape=shape,
-            cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=bar_dia_mm,
-            fc_mpa=fc_mpa,
-            fy_mpa=fy_mpa,
-            phi=phi,
-            column_type=column_type,
-            axial_cap_factor_value=axial_cap_factor_value,
-            axis="x",
-            bar_area_single_override_mm2=bar_area_single,
-            bars_width_face=bars_width_face,
-            bars_depth_face=bars_depth_face,
-            bars_circular=bars_circular,
-        )
-        curve_y = interaction_curve(
-            geometry=geometry,
-            shape=shape,
-            cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=bar_dia_mm,
-            fc_mpa=fc_mpa,
-            fy_mpa=fy_mpa,
-            phi=phi,
-            column_type=column_type,
-            axial_cap_factor_value=axial_cap_factor_value,
-            axis="y",
-            bar_area_single_override_mm2=bar_area_single,
-            bars_width_face=bars_width_face,
-            bars_depth_face=bars_depth_face,
-            bars_circular=bars_circular,
-        )
-        pmm_responses = rotated_pmm_responses(
-            geometry=geometry,
-            shape=shape,
-            cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=bar_dia_mm,
-            fc_mpa=fc_mpa,
-            fy_mpa=fy_mpa,
-            phi=phi,
-            column_type=column_type,
-            axial_cap_factor_value=axial_cap_factor_value,
-            bar_area_single_override_mm2=bar_area_single,
-            bars_width_face=bars_width_face,
-            bars_depth_face=bars_depth_face,
-            bars_circular=bars_circular,
-            angle_count=31,
-            target_fiber_size_mm=25.0,
-        )
-        _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
-        return float(governing["ratio"])
-
-    lower = max(ast_min, 1e-6)
-    lower_ratio = governing_ratio_for_ast(lower)
-    if lower_ratio <= 1.0:
-        return lower, True
-
-    upper = min(max(current_ast, lower), ast_max)
-    upper_ratio = governing_ratio_for_ast(upper)
-    while upper_ratio > 1.0 and upper < ast_max - 1e-6:
-        upper = min(ast_max, max(upper * 1.35, upper + 0.05 * geometry.ag_mm2))
-        upper_ratio = governing_ratio_for_ast(upper)
-
-    if upper_ratio > 1.0:
-        return float("nan"), False
-
-    for _ in range(12):
-        mid = 0.5 * (lower + upper)
-        if governing_ratio_for_ast(mid) <= 1.0:
-            upper = mid
-        else:
-            lower = mid
-    return upper, True
-
-
-def analyze_manual_layout(
-    geometry: SectionGeometry,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    min_clear_spacing_user_mm: float,
-    phi: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    min_ratio: float,
-    max_ratio: float,
-    shape: Shape,
-    axial_cap_factor_value: float,
-    ast_required_pmm_mm2: float,
-    pmm_required_found: bool,
-    governing_pu_kN: float,
-    governing_case_name: str,
-    governing_ratio: float,
-    phi_mnx_at_pu_kNm: float,
-    phi_mny_at_pu_kNm: float,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> DesignResult:
-    min_clear = minimum_clear_spacing_mm(bar_dia_mm, min_clear_spacing_user_mm)
-    ast_axial_starter, ast_equation, ast_min = required_steel_area_mm2(
-        governing_pu_kN,
-        phi,
-        fc_mpa,
-        fy_mpa,
-        geometry.ag_mm2,
-        min_ratio,
-        axial_cap_factor_value,
-    )
-    ast_max = max_ratio * geometry.ag_mm2
-
-    if shape == "Circular":
-        n_bars = int(bars_circular or 0)
-        ast = n_bars * bar_area_mm2(bar_dia_mm)
-        spacing_ok, spacing_note = circular_spacing_check(
-            diameter_mm=float(geometry.diameter_mm),
-            clear_cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=bar_dia_mm,
-            n_bars=n_bars,
-            min_clear_spacing_mm=min_clear,
-        )
-    else:
-        n_bars = total_bars_rectangular(int(bars_width_face or 0), int(bars_depth_face or 0))
-        ast = n_bars * bar_area_mm2(bar_dia_mm)
-        spacing_ok, spacing_note = rectangular_spacing_check(
-            width_mm=float(geometry.width_mm),
-            depth_mm=float(geometry.depth_mm),
-            clear_cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            bar_dia_mm=bar_dia_mm,
-            bars_width_face=int(bars_width_face or 0),
-            bars_depth_face=int(bars_depth_face or 0),
-            min_clear_spacing_mm=min_clear,
-        )
-    minimum_ecc_value = minimum_eccentricity_mm(geometry)
-
-    phi_pn = design_strength_kN(phi, fc_mpa, fy_mpa, geometry.ag_mm2, ast, axial_cap_factor_value)
-    overall_ok = spacing_ok and ast >= ast_min and ast <= ast_max and governing_ratio <= 1.0
-    return DesignResult(
-        ast_required_mm2=ast_required_pmm_mm2,
-        ast_axial_starter_mm2=ast_axial_starter,
-        ast_from_equation_mm2=ast_equation,
-        ast_min_mm2=ast_min,
-        ast_max_mm2=ast_max,
-        phi_pn_kN=phi_pn,
-        steel_ratio_percent=100.0 * ast / geometry.ag_mm2,
-        spacing_ok=spacing_ok,
-        spacing_note=spacing_note,
-        overall_ok=overall_ok,
-        minimum_eccentricity_mm=minimum_ecc_value,
-        governing_ratio=governing_ratio,
-        governing_load_case=governing_case_name,
-        phi_mnx_at_pu_kNm=phi_mnx_at_pu_kNm,
-        phi_mny_at_pu_kNm=phi_mny_at_pu_kNm,
-        pmm_required_found=pmm_required_found,
-    )
-
-
-def auto_design_options(
-    geometry: SectionGeometry,
-    cover_mm: float,
-    tie_dia_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    phi: float,
-    column_type: str,
-    min_ratio: float,
-    max_ratio: float,
-    min_clear_spacing_user_mm: float,
-    shape: Shape,
-    bar_sizes_mm: list[float],
-    load_df: pd.DataFrame,
-    axial_cap_factor_value: float,
-) -> pd.DataFrame:
-    rows: list[dict] = []
-    max_pu_for_prefilter = float(load_df["Pu (kN)"].max()) if not load_df.empty else 0.0
-    ast_required_prefilter, _, _ = required_steel_area_mm2(max_pu_for_prefilter, phi, fc_mpa, fy_mpa, geometry.ag_mm2, min_ratio, axial_cap_factor_value)
-    eccentricity_value = minimum_eccentricity_mm(geometry)
-
-    for dia in bar_sizes_mm:
-        if shape == "Circular":
-            for n_bars in range(6, 33):
-                ast = n_bars * bar_area_mm2(dia)
-                if ast < ast_required_prefilter or ast > max_ratio * geometry.ag_mm2:
-                    continue
-                curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "x", bars_circular=n_bars)
-                curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "y", bars_circular=n_bars)
-                pmm_responses = rotated_pmm_responses(
-                    geometry=geometry,
-                    shape=shape,
-                    cover_mm=cover_mm,
-                    tie_dia_mm=tie_dia_mm,
-                    bar_dia_mm=dia,
-                    fc_mpa=fc_mpa,
-                    fy_mpa=fy_mpa,
-                    phi=phi,
-                    column_type=column_type,
-                    axial_cap_factor_value=axial_cap_factor_value,
-                    bars_circular=n_bars,
-                    angle_count=19,
-                    target_fiber_size_mm=40.0,
-                )
-                _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
-                result = analyze_manual_layout(
-                    geometry=geometry,
-                    cover_mm=cover_mm,
-                    tie_dia_mm=tie_dia_mm,
-                    bar_dia_mm=dia,
-                    min_clear_spacing_user_mm=min_clear_spacing_user_mm,
-                    phi=phi,
-                    fc_mpa=fc_mpa,
-                    fy_mpa=fy_mpa,
-                    min_ratio=min_ratio,
-                    max_ratio=max_ratio,
-                    shape=shape,
-                    axial_cap_factor_value=axial_cap_factor_value,
-                    ast_required_pmm_mm2=ast,
-                    pmm_required_found=True,
-                    governing_pu_kN=governing["pu"],
-                    governing_case_name=governing["case"],
-                    governing_ratio=governing["ratio"],
-                    phi_mnx_at_pu_kNm=governing["mnx"],
-                    phi_mny_at_pu_kNm=governing["mny"],
-                    bars_circular=n_bars,
-                )
-                if result.spacing_ok and ast <= result.ast_max_mm2 and result.overall_ok:
-                    rows.append(
-                        {
-                            "Bar size (mm)": dia,
-                            "Arrangement": f"{n_bars} bars around perimeter",
-                            "Total bars": n_bars,
-                            "Ast provided (mm2)": round(ast, 1),
-                            "Steel ratio (%)": round(result.steel_ratio_percent, 3),
-                            "Governing case": governing["case"],
-                            "PMM ratio": round(governing["ratio"], 3),
-                            "phi Pn (kN)": round(result.phi_pn_kN, 1),
-                            "Spacing note": result.spacing_note,
-                        }
-                    )
-        else:
-            for bx in range(2, 13):
-                for by in range(2, 13):
-                    total = total_bars_rectangular(bx, by)
-                    if total < 4:
-                        continue
-                    ast = total * bar_area_mm2(dia)
-                    if ast < ast_required_prefilter or ast > max_ratio * geometry.ag_mm2:
-                        continue
-                    curve_x = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "x", bars_width_face=bx, bars_depth_face=by)
-                    curve_y = interaction_curve(geometry, shape, cover_mm, tie_dia_mm, dia, fc_mpa, fy_mpa, phi, column_type, axial_cap_factor_value, "y", bars_width_face=bx, bars_depth_face=by)
-                    pmm_responses = rotated_pmm_responses(
-                        geometry=geometry,
-                        shape=shape,
-                        cover_mm=cover_mm,
-                        tie_dia_mm=tie_dia_mm,
-                        bar_dia_mm=dia,
-                        fc_mpa=fc_mpa,
-                        fy_mpa=fy_mpa,
-                        phi=phi,
-                        column_type=column_type,
-                        axial_cap_factor_value=axial_cap_factor_value,
-                        bars_width_face=bx,
-                        bars_depth_face=by,
-                        angle_count=19,
-                        target_fiber_size_mm=40.0,
-                    )
-                    _, governing = evaluate_load_cases_true(load_df, curve_x, curve_y, pmm_responses, eccentricity_value)
-                    result = analyze_manual_layout(
-                        geometry=geometry,
-                        cover_mm=cover_mm,
-                        tie_dia_mm=tie_dia_mm,
-                        bar_dia_mm=dia,
-                        min_clear_spacing_user_mm=min_clear_spacing_user_mm,
-                        phi=phi,
-                        fc_mpa=fc_mpa,
-                        fy_mpa=fy_mpa,
-                        min_ratio=min_ratio,
-                        max_ratio=max_ratio,
-                        shape=shape,
-                        axial_cap_factor_value=axial_cap_factor_value,
-                        ast_required_pmm_mm2=ast,
-                        pmm_required_found=True,
-                        governing_pu_kN=governing["pu"],
-                        governing_case_name=governing["case"],
-                        governing_ratio=governing["ratio"],
-                        phi_mnx_at_pu_kNm=governing["mnx"],
-                        phi_mny_at_pu_kNm=governing["mny"],
-                        bars_width_face=bx,
-                        bars_depth_face=by,
-                    )
-                    if result.spacing_ok and ast <= result.ast_max_mm2 and result.overall_ok:
-                        rows.append(
-                            {
-                                "Bar size (mm)": dia,
-                                "Arrangement": f"{bx} bars on top/bottom, {by} bars on left/right",
-                                "Total bars": total,
-                                "Ast provided (mm2)": round(ast, 1),
-                                "Steel ratio (%)": round(result.steel_ratio_percent, 3),
-                                "Governing case": governing["case"],
-                                "PMM ratio": round(governing["ratio"], 3),
-                                "phi Pn (kN)": round(result.phi_pn_kN, 1),
-                                "Spacing note": result.spacing_note,
-                            }
-                        )
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    return df.sort_values(by=["Ast provided (mm2)", "Total bars", "Bar size (mm)"]).drop_duplicates().reset_index(drop=True)
-
-
-def section_figure(
-    geometry: SectionGeometry,
-    shape: Shape,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    note_text: str = "",
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> go.Figure:
-    fig = go.Figure()
-    if shape == "Circular":
-        diameter = float(geometry.diameter_mm)
-        radius = diameter / 2.0
-        theta = [i * 2.0 * math.pi / 180.0 for i in range(361)]
-        fig.add_trace(
-            go.Scatter(
-                x=[radius * math.cos(t) for t in theta],
-                y=[radius * math.sin(t) for t in theta],
-                mode="lines",
-                name="Section",
-                line={"color": "#0f172a", "width": 3},
-            )
-        )
-        core_radius = radius - cover_mm - tie_dia_mm
-        if core_radius > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=[core_radius * math.cos(t) for t in theta],
-                    y=[core_radius * math.sin(t) for t in theta],
-                    mode="lines",
-                    name="Tie line",
-                    line={"color": "#94a3b8", "dash": "dash"},
-                )
-            )
-        coords = circular_bar_coordinates(diameter, cover_mm, tie_dia_mm, bar_dia_mm, int(bars_circular or 0))
-        size_ref = max(10.0, bar_dia_mm * 1.2)
-        limit = radius * 1.15
-    else:
-        width = float(geometry.width_mm)
-        depth = float(geometry.depth_mm)
-        x_outline = [-width / 2.0, width / 2.0, width / 2.0, -width / 2.0, -width / 2.0]
-        y_outline = [-depth / 2.0, -depth / 2.0, depth / 2.0, depth / 2.0, -depth / 2.0]
-        fig.add_trace(go.Scatter(x=x_outline, y=y_outline, mode="lines", name="Section", line={"color": "#0f172a", "width": 3}))
-        x_tie = [
-            -width / 2.0 + cover_mm + tie_dia_mm / 2.0,
-            width / 2.0 - cover_mm - tie_dia_mm / 2.0,
-            width / 2.0 - cover_mm - tie_dia_mm / 2.0,
-            -width / 2.0 + cover_mm + tie_dia_mm / 2.0,
-            -width / 2.0 + cover_mm + tie_dia_mm / 2.0,
-        ]
-        y_tie = [
-            -depth / 2.0 + cover_mm + tie_dia_mm / 2.0,
-            -depth / 2.0 + cover_mm + tie_dia_mm / 2.0,
-            depth / 2.0 - cover_mm - tie_dia_mm / 2.0,
-            depth / 2.0 - cover_mm - tie_dia_mm / 2.0,
-            -depth / 2.0 + cover_mm + tie_dia_mm / 2.0,
-        ]
-        fig.add_trace(go.Scatter(x=x_tie, y=y_tie, mode="lines", name="Tie line", line={"color": "#94a3b8", "dash": "dash"}))
-        coords = rectangular_bar_coordinates(width, depth, cover_mm, tie_dia_mm, bar_dia_mm, int(bars_width_face or 0), int(bars_depth_face or 0))
-        size_ref = max(10.0, bar_dia_mm * 1.2)
-        limit = max(width, depth) * 0.65
-
-    if coords:
-        fig.add_trace(
-            go.Scatter(
-                x=[x for x, _ in coords],
-                y=[y for _, y in coords],
-                mode="markers",
-                name="Main bars",
-                marker={"size": size_ref, "color": "#dc2626", "line": {"color": "#7f1d1d", "width": 1}},
-            )
-        )
-
-    fig.update_layout(
-        title={"text": "Section Reinforcement", "y": 0.97},
-        template="plotly_white",
-        height=520,
-        xaxis={"title": "x (mm)", "scaleanchor": "y", "range": [-limit, limit]},
-        yaxis={"title": "y (mm)", "range": [-limit, limit]},
-        legend={"orientation": "h"},
-        margin={"l": 20, "r": 20, "t": 80, "b": 20},
-    )
-    if note_text:
-        fig.add_annotation(
-            xref="paper",
-            yref="paper",
-            x=0.02,
-            y=0.98,
-            text=note_text,
-            showarrow=False,
-            align="left",
-            bgcolor="rgba(255,255,255,0.92)",
-            bordercolor="#cbd5e1",
-            borderwidth=1,
-        )
-    return fig
-
-
-def axial_capacity_plot(result: DesignResult, pu_kN: float) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=["Demand Pu", "Capacity phi Pn"], y=[pu_kN, result.phi_pn_kN], marker_color=["#f97316", "#16a34a"]))
-    fig.update_layout(template="plotly_white", height=360, title="Axial Demand vs Capacity", yaxis_title="kN", margin={"l": 20, "r": 20, "t": 50, "b": 20})
-    return fig
-
-
-def interaction_plot(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: float) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_x["phi_mn_kNm"], y=df_x["phi_pn_kN"], mode="lines", name="P-Mx"))
-    fig.add_trace(go.Scatter(x=df_y["phi_mn_kNm"], y=df_y["phi_pn_kN"], mode="lines", name="P-My"))
-    fig.add_hline(y=pu_kN, line_dash="dash", line_color="#dc2626", annotation_text=f"Pu = {pu_kN:,.0f} kN")
-    fig.update_layout(template="plotly_white", height=460, title="Strain Compatibility Interaction Curves", xaxis_title="phi Mn (kN-m)", yaxis_title="phi Pn (kN)")
-    return fig
-
-
-def section_note_text(
-    shape: Shape,
-    bar_dia_mm: float,
-    total_bars: int,
-    ast_mm2: float,
-    rho_percent: float,
-    spacing_note: str,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-) -> str:
-    if shape == "Circular":
-        arrangement = f"{int(bars_circular or 0)} bars around perimeter"
-    else:
-        arrangement = f"Top/bottom: {int(bars_width_face or 0)} each, left/right: {int(bars_depth_face or 0)} each"
-    return (
-        f"{arrangement}<br>"
-        f"Main bars: DB{int(bar_dia_mm)} | total bars = {total_bars}<br>"
-        f"Ast = {ast_mm2:,.0f} mm2 | rho = {rho_percent:.3f}%<br>"
-        f"{spacing_note}"
-    )
-
-
-def interaction_plot_with_demand(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: float, mx_kNm: float, my_kNm: float) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_x["phi_mn_kNm"], y=df_x["phi_pn_kN"], mode="lines", name="about x", line={"color": "#2563eb", "width": 3}))
-    fig.add_trace(go.Scatter(x=df_y["phi_mn_kNm"], y=df_y["phi_pn_kN"], mode="lines", name="about y", line={"color": "#e11d48", "width": 3}))
-    fig.add_trace(
-        go.Scatter(
-            x=[abs(mx_kNm)],
-            y=[pu_kN],
-            mode="markers",
-            name="Pu, Mux",
-            marker={"symbol": "x", "size": 10, "color": "#2563eb", "line": {"width": 2}},
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=[abs(my_kNm)],
-            y=[pu_kN],
-            mode="markers",
-            name="Pu, Muy",
-            marker={"symbol": "x", "size": 10, "color": "#e11d48", "line": {"width": 2}},
-        )
-    )
-    fig.update_layout(
-        template="plotly_white",
-        height=460,
-        title={"text": "Uniaxial Interaction Curves", "y": 0.97},
-        xaxis_title="phi Mn (kN-m)",
-        yaxis_title="phi Pn (kN)",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "x": 0.0},
-        margin={"l": 20, "r": 20, "t": 90, "b": 20},
-    )
-    return fig
-
-
-def concrete_fibers(
-    geometry: SectionGeometry,
-    shape: Shape,
-    target_fiber_size_mm: float = 25.0,
-) -> list[tuple[float, float, float]]:
-    fibers: list[tuple[float, float, float]] = []
-    if shape == "Circular":
-        diameter = float(geometry.diameter_mm)
-        radius = diameter / 2.0
-        divisions = max(24, min(60, int(math.ceil(diameter / target_fiber_size_mm))))
-        step = diameter / divisions
-        start = -radius + 0.5 * step
-        for i in range(divisions):
-            x = start + i * step
-            for j in range(divisions):
-                y = start + j * step
-                if x * x + y * y <= radius * radius:
-                    fibers.append((x, y, step * step))
-        return fibers
-
-    width = float(geometry.width_mm)
-    depth = float(geometry.depth_mm)
-    nx = max(20, min(60, int(math.ceil(width / target_fiber_size_mm))))
-    ny = max(20, min(60, int(math.ceil(depth / target_fiber_size_mm))))
-    dx = width / nx
-    dy = depth / ny
-    x0 = -width / 2.0 + 0.5 * dx
-    y0 = -depth / 2.0 + 0.5 * dy
-    for i in range(nx):
-        x = x0 + i * dx
-        for j in range(ny):
-            y = y0 + j * dy
-            fibers.append((x, y, dx * dy))
-    return fibers
-
-
-def section_support_coordinate(geometry: SectionGeometry, shape: Shape, theta_rad: float) -> float:
-    if shape == "Circular":
-        return float(geometry.diameter_mm) / 2.0
-    width = float(geometry.width_mm)
-    depth = float(geometry.depth_mm)
-    return 0.5 * width * abs(math.cos(theta_rad)) + 0.5 * depth * abs(math.sin(theta_rad))
-
-
-def rotated_section_response(
-    geometry: SectionGeometry,
-    shape: Shape,
-    theta_rad: float,
-    neutral_axis_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    phi: float,
-    column_type: str,
-    axial_cap_factor_value: float,
-    fibers: list[tuple[float, float, float]],
-    bar_coords: list[tuple[float, float]],
-    bar_area_single_mm2: float,
-) -> dict[str, float]:
-    eps_cu = 0.003
-    beta1 = beta1_aci(fc_mpa)
-    support = section_support_coordinate(geometry, shape, theta_rad)
-    a_depth = min(beta1 * neutral_axis_mm, 2.0 * support)
-    threshold = support - a_depth
-    cos_t = math.cos(theta_rad)
-    sin_t = math.sin(theta_rad)
-
-    concrete_force_n = 0.0
-    mx_nmm = 0.0
-    my_nmm = 0.0
-    for x, y, area in fibers:
-        u = x * cos_t + y * sin_t
-        if u >= threshold:
-            force = 0.85 * fc_mpa * area
-            concrete_force_n += force
-            mx_nmm += force * y
-            my_nmm += force * x
-
-    steel_force_n = 0.0
-    max_tension_strain = 0.0
-    for x, y in bar_coords:
-        u = x * cos_t + y * sin_t
-        dist_from_face = support - u
-        strain = eps_cu * (1.0 - dist_from_face / neutral_axis_mm)
-        max_tension_strain = max(max_tension_strain, -strain)
-        stress = steel_stress_mpa(strain, fy_mpa)
-        in_compression_block = u >= threshold
-        force = bar_area_single_mm2 * (stress - 0.85 * fc_mpa) if in_compression_block else bar_area_single_mm2 * stress
-        steel_force_n += force
-        mx_nmm += force * y
-        my_nmm += force * x
-
-    nominal_p_n = concrete_force_n + steel_force_n
-    phi_value = strain_based_phi(column_type, fy_mpa, max_tension_strain)
-    phi_pn_kN = phi_value * nominal_p_n / 1000.0
-    phi_pn_max_kN = design_strength_kN(
-        phi=phi,
-        fc_mpa=fc_mpa,
-        fy_mpa=fy_mpa,
-        ag_mm2=geometry.ag_mm2,
-        ast_mm2=len(bar_coords) * bar_area_single_mm2,
-        axial_cap_factor_value=axial_cap_factor_value,
-    )
-    return {
-        "phi_pn_kN": min(phi_pn_kN, phi_pn_max_kN),
-        "phi_mx_kNm": phi_value * mx_nmm / 1_000_000.0,
-        "phi_my_kNm": phi_value * my_nmm / 1_000_000.0,
-        "phi_value": phi_value,
-        "max_tension_strain": max_tension_strain,
-    }
-
-
-def pmm_sample_fractions() -> list[float]:
-    return [0.02, 0.05, 0.08, 0.12, 0.16, 0.22, 0.30, 0.40, 0.55, 0.75, 1.0, 1.35, 1.8, 2.4, 3.2, 4.5, 6.0]
-
-
-def rotated_pmm_responses(
-    geometry: SectionGeometry,
-    shape: Shape,
-    cover_mm: float,
-    tie_dia_mm: float,
-    bar_dia_mm: float,
-    fc_mpa: float,
-    fy_mpa: float,
-    phi: float,
-    column_type: str,
-    axial_cap_factor_value: float,
-    bar_area_single_override_mm2: float | None = None,
-    bars_width_face: int | None = None,
-    bars_depth_face: int | None = None,
-    bars_circular: int | None = None,
-    angle_count: int = 49,
-    target_fiber_size_mm: float = 25.0,
-) -> list[dict]:
-    fibers = concrete_fibers(geometry, shape, target_fiber_size_mm=target_fiber_size_mm)
-    bar_coords = section_bar_coordinates(
-        geometry=geometry,
-        shape=shape,
-        cover_mm=cover_mm,
-        tie_dia_mm=tie_dia_mm,
-        bar_dia_mm=bar_dia_mm,
-        bars_width_face=bars_width_face,
-        bars_depth_face=bars_depth_face,
-        bars_circular=bars_circular,
-    )
-    bar_area_single = bar_area_single_override_mm2 if bar_area_single_override_mm2 is not None else bar_area_mm2(bar_dia_mm)
-    responses: list[dict] = []
-    for angle_index in range(angle_count):
-        theta = 2.0 * math.pi * angle_index / angle_count
-        support = section_support_coordinate(geometry, shape, theta)
-        for fraction in pmm_sample_fractions():
-            c_value = max(1.0, 2.0 * support * fraction)
-            response = rotated_section_response(
-                geometry=geometry,
-                shape=shape,
-                theta_rad=theta,
-                neutral_axis_mm=c_value,
-                fc_mpa=fc_mpa,
-                fy_mpa=fy_mpa,
-                phi=phi,
-                column_type=column_type,
-                axial_cap_factor_value=axial_cap_factor_value,
-                fibers=fibers,
-                bar_coords=bar_coords,
-                bar_area_single_mm2=bar_area_single,
-            )
-            responses.append(
-                {
-                    "theta_rad": theta,
-                    "c_mm": c_value,
-                    "phi_pn_kN": response["phi_pn_kN"],
-                    "phi_mx_kNm": response["phi_mx_kNm"],
-                    "phi_my_kNm": response["phi_my_kNm"],
-                    "phi_value": response["phi_value"],
-                    "max_tension_strain": response["max_tension_strain"],
-                }
-            )
-    return responses
-
-
-def pmm_slice_from_responses(responses: list[dict], pu_kN: float) -> pd.DataFrame:
-    if not responses:
-        return pd.DataFrame(columns=["mx_kNm", "my_kNm", "theta_rad"])
-    rows: list[dict[str, float]] = []
-    theta_values = sorted({item["theta_rad"] for item in responses})
-    for theta in theta_values:
-        series = [item for item in responses if abs(item["theta_rad"] - theta) < 1e-9]
-        series = sorted(series, key=lambda item: item["phi_pn_kN"], reverse=True)
-        found = False
-        for first, second in zip(series, series[1:]):
-            p1 = first["phi_pn_kN"]
-            p2 = second["phi_pn_kN"]
-            if (p1 >= pu_kN >= p2) or (p2 >= pu_kN >= p1):
-                ratio = 0.0 if abs(p2 - p1) < 1e-9 else (pu_kN - p1) / (p2 - p1)
-                rows.append(
-                    {
-                        "theta_rad": theta,
-                        "mx_kNm": first["phi_mx_kNm"] + ratio * (second["phi_mx_kNm"] - first["phi_mx_kNm"]),
-                        "my_kNm": first["phi_my_kNm"] + ratio * (second["phi_my_kNm"] - first["phi_my_kNm"]),
-                    }
-                )
-                found = True
-                break
-        if not found:
-            above = [item for item in series if item["phi_pn_kN"] >= pu_kN]
-            if above:
-                best = max(above, key=lambda item: math.hypot(item["phi_mx_kNm"], item["phi_my_kNm"]))
-                rows.append({"theta_rad": theta, "mx_kNm": best["phi_mx_kNm"], "my_kNm": best["phi_my_kNm"]})
-    if not rows:
-        return pd.DataFrame(columns=["mx_kNm", "my_kNm", "theta_rad"])
-    rows.append(rows[0].copy())
-    return pd.DataFrame(rows)
-
-
-def ray_polygon_utilization(contour_df: pd.DataFrame, demand_mx_kNm: float, demand_my_kNm: float) -> float:
-    if contour_df.empty:
-        return float("inf")
-    if abs(demand_mx_kNm) < 1e-9 and abs(demand_my_kNm) < 1e-9:
-        return 0.0
-    direction = (demand_mx_kNm, demand_my_kNm)
-    best_t: float | None = None
-    points = list(zip(contour_df["mx_kNm"], contour_df["my_kNm"]))
-    for (ax, ay), (bx, by) in zip(points, points[1:]):
-        sx = bx - ax
-        sy = by - ay
-        denominator = direction[0] * sy - direction[1] * sx
-        if abs(denominator) < 1e-9:
-            continue
-        t = (ax * sy - ay * sx) / denominator
-        u = (ax * direction[1] - ay * direction[0]) / denominator
-        if t >= 0.0 and 0.0 <= u <= 1.0:
-            if best_t is None or t < best_t:
-                best_t = t
-    if best_t is None or best_t <= 0.0:
-        return float("inf")
-    return 1.0 / best_t
-
-
-def pmm_slice_plot(contour_df: pd.DataFrame, pu_kN: float, mx_kNm: float, my_kNm: float, ratio: float) -> go.Figure:
-    contour = contour_df.copy()
-    fig = go.Figure()
-    if not contour.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=contour["mx_kNm"],
-                y=contour["my_kNm"],
-                mode="lines",
-                name="PMM slice",
-                line={"color": "#0284c7", "width": 2.5},
-                fill="toself",
-                fillcolor="rgba(2, 132, 199, 0.10)",
-            )
-        )
-    fig.add_trace(
-        go.Scatter(
-            x=[0.0, mx_kNm],
-            y=[0.0, my_kNm],
-            mode="lines+markers",
-            name="demand",
-            line={"color": "#0f766e", "width": 2},
-            marker={"size": 6, "color": "#0f766e"},
-        )
-    )
-    fig.add_annotation(
-        x=mx_kNm,
-        y=my_kNm,
-        text=f"PMM U = {ratio:.3f}",
-        showarrow=True,
-        arrowhead=2,
-        ax=30,
-        ay=-20,
-    )
-    max_x = max(abs(mx_kNm), abs(contour["mx_kNm"]).max() if not contour.empty else 0.0, 1.0)
-    max_y = max(abs(my_kNm), abs(contour["my_kNm"]).max() if not contour.empty else 0.0, 1.0)
-    fig.update_layout(
-        template="plotly_white",
-        height=420,
-        title={"text": f"PMM Mux-My Slice at Pu = {pu_kN:,.0f} kN", "y": 0.97},
-        xaxis={"title": "Mux (kN-m)", "zeroline": True, "range": [-1.15 * max_x, 1.15 * max_x], "scaleanchor": "y"},
-        yaxis={"title": "Muy (kN-m)", "zeroline": True, "range": [-1.15 * max_y, 1.15 * max_y]},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.05, "x": 0.0},
-        margin={"l": 20, "r": 20, "t": 85, "b": 20},
-    )
-    return fig
-
-
-def pmm_surface_plot(
-    responses: list[dict],
-    contour_df: pd.DataFrame,
-    pu_kN: float,
-    mx_kNm: float,
-    my_kNm: float,
-    ratio: float,
-) -> go.Figure:
-    if not responses:
-        return go.Figure()
-    theta_count = len(sorted({item["theta_rad"] for item in responses}))
-    expected_points = theta_count + 1
-    p_max = max(item["phi_pn_kN"] for item in responses)
-    p_levels = [p_max * i / 24.0 for i in range(1, 25)]
-    x_grid: list[list[float]] = []
-    y_grid: list[list[float]] = []
-    z_grid: list[list[float]] = []
-    for p_level in p_levels:
-        contour_at_p = pmm_slice_from_responses(responses, p_level)
-        if contour_at_p.empty or len(contour_at_p) != expected_points:
-            continue
-        x_grid.append(contour_at_p["mx_kNm"].tolist())
-        y_grid.append(contour_at_p["my_kNm"].tolist())
-        z_grid.append([p_level] * len(contour_at_p))
-
-    current_slice = contour_df.copy()
-    fig = go.Figure()
-    fig.add_trace(
-        go.Surface(
-            x=x_grid,
-            y=y_grid,
-            z=z_grid,
-            showscale=False,
-            opacity=0.62,
-            colorscale=[[0.0, "#bfdbfe"], [1.0, "#60a5fa"]],
-            name="PMM surface",
-            hovertemplate="Mux=%{x:.1f}<br>Muy=%{y:.1f}<br>Pu=%{z:.1f}<extra></extra>",
-        )
-    )
-    if not current_slice.empty:
-        fig.add_trace(
-            go.Scatter3d(
-                x=current_slice["mx_kNm"],
-                y=current_slice["my_kNm"],
-                z=[pu_kN] * len(current_slice),
-                mode="lines",
-                name="current Pu slice",
-                line={"color": "#0284c7", "width": 5},
-            )
-        )
-    fig.add_trace(
-        go.Scatter3d(
-            x=[0.0, mx_kNm],
-            y=[0.0, my_kNm],
-            z=[0.0, pu_kN],
-            mode="lines",
-            name="demand vector",
-            line={"color": "#0f766e", "width": 6},
-        )
-    )
-    fig.add_trace(
-        go.Scatter3d(
-            x=[mx_kNm],
-            y=[my_kNm],
-            z=[pu_kN],
-            mode="markers+text",
-            name="load point",
-            marker={"size": 5, "color": "#115e59"},
-            text=[f"U={ratio:.3f}"],
-            textposition="top center",
-        )
-    )
-    fig.update_layout(
-        template="plotly_white",
-        height=520,
-        title={"text": "3D PMM Interaction Surface with Load Point", "y": 0.97},
-        scene={
-            "xaxis_title": "Mux (kN-m)",
-            "yaxis_title": "Muy (kN-m)",
-            "zaxis_title": "Pu (kN)",
-            "camera": {"eye": {"x": 1.6, "y": 1.4, "z": 1.2}},
-        },
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.05, "x": 0.0},
-        margin={"l": 10, "r": 10, "t": 85, "b": 10},
-    )
-    return fig
-
-
-def _nonclosing_points(contour_df: pd.DataFrame) -> pd.DataFrame:
-    if contour_df.empty:
-        return contour_df
-    if len(contour_df) > 1 and abs(contour_df.iloc[0]["mx_kNm"] - contour_df.iloc[-1]["mx_kNm"]) < 1e-9 and abs(contour_df.iloc[0]["my_kNm"] - contour_df.iloc[-1]["my_kNm"]) < 1e-9:
-        return contour_df.iloc[:-1].copy()
-    return contour_df.copy()
-
-
-@st.cache_data(show_spinner=False)
-def run_verification_suite() -> pd.DataFrame:
-    rows: list[dict[str, str]] = []
-    column_type = "Tied"
-    compression_phi = phi_factor(column_type)
-    cap = axial_cap_factor(column_type)
-
-    square_geo = section_geometry("Square", 400.0, 400.0, None)
-    square_curve_x = interaction_curve(square_geo, "Square", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_width_face=4, bars_depth_face=4)
-    square_curve_y = interaction_curve(square_geo, "Square", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_width_face=4, bars_depth_face=4)
-    square_pu = 0.4 * min(float(square_curve_x["phi_pn_kN"].max()), float(square_curve_y["phi_pn_kN"].max()))
-    square_mnx = moment_capacity_at_pu(square_curve_x, square_pu)
-    square_mny = moment_capacity_at_pu(square_curve_y, square_pu)
-    square_diff = abs(square_mnx - square_mny) / max(square_mnx, square_mny, 1e-9)
-    rows.append(
-        {
-            "Benchmark": "Square symmetry",
-            "Check": "Mnx(Pu) vs Mny(Pu)",
-            "Result": f"{square_mnx:,.1f} vs {square_mny:,.1f} kN-m",
-            "Error": f"{square_diff * 100.0:.2f}%",
-            "Status": "OK" if square_diff <= 0.05 else "Review",
-        }
-    )
-
-    rect_geo = section_geometry("Rectangle", 300.0, 500.0, None)
-    rect_curve_x = interaction_curve(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_width_face=4, bars_depth_face=4)
-    rect_curve_y = interaction_curve(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_width_face=4, bars_depth_face=4)
-    rect_responses = rotated_pmm_responses(rect_geo, "Rectangle", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, bars_width_face=4, bars_depth_face=4, angle_count=72, target_fiber_size_mm=25.0)
-    rect_pu = 0.4 * min(float(rect_curve_x["phi_pn_kN"].max()), float(rect_curve_y["phi_pn_kN"].max()))
-    rect_slice = _nonclosing_points(pmm_slice_from_responses(rect_responses, rect_pu))
-    rect_mnx = moment_capacity_at_pu(rect_curve_x, rect_pu)
-    rect_mny = moment_capacity_at_pu(rect_curve_y, rect_pu)
-    rect_slice_mx = abs(rect_slice["mx_kNm"]).max() if not rect_slice.empty else 0.0
-    rect_slice_my = abs(rect_slice["my_kNm"]).max() if not rect_slice.empty else 0.0
-    rect_error = max(abs(rect_slice_mx - rect_mnx) / max(rect_mnx, 1e-9), abs(rect_slice_my - rect_mny) / max(rect_mny, 1e-9))
-    rows.append(
-        {
-            "Benchmark": "Rectangle axis consistency",
-            "Check": "PMM slice intercepts vs uniaxial curves",
-            "Result": f"x: {rect_slice_mx:,.1f}/{rect_mnx:,.1f}, y: {rect_slice_my:,.1f}/{rect_mny:,.1f}",
-            "Error": f"{rect_error * 100.0:.2f}%",
-            "Status": "OK" if rect_error <= 0.10 else "Review",
-        }
-    )
-
-    circ_geo = section_geometry("Circular", None, None, 600.0)
-    circ_responses = rotated_pmm_responses(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, bars_circular=8, angle_count=72, target_fiber_size_mm=20.0)
-    circ_curve_x = interaction_curve(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "x", bars_circular=8)
-    circ_curve_y = interaction_curve(circ_geo, "Circular", 50.0, 10.0, 20.0, 28.0, 420.0, compression_phi, column_type, cap, "y", bars_circular=8)
-    circ_pu = 0.4 * min(float(circ_curve_x["phi_pn_kN"].max()), float(circ_curve_y["phi_pn_kN"].max()))
-    circ_slice = _nonclosing_points(pmm_slice_from_responses(circ_responses, circ_pu))
-    radii = [math.hypot(float(mx), float(my)) for mx, my in zip(circ_slice["mx_kNm"], circ_slice["my_kNm"])] if not circ_slice.empty else []
-    circ_cov = (pd.Series(radii).std() / max(pd.Series(radii).mean(), 1e-9)) if radii else float("inf")
-    rows.append(
-        {
-            "Benchmark": "Circular rotational invariance",
-            "Check": "Radius variation on PMM slice",
-            "Result": f"mean R = {pd.Series(radii).mean():,.1f} kN-m" if radii else "No slice",
-            "Error": f"{circ_cov * 100.0:.2f}%",
-            "Status": "OK" if circ_cov <= 0.08 else "Review",
-        }
-    )
-
-    return pd.DataFrame(rows)
-
-
-def clean_load_cases(df: pd.DataFrame) -> pd.DataFrame:
-    required_cols = ["Case", "Pu (kN)", "Mx (kN-m)", "My (kN-m)"]
-    working = df.copy()
-    for col in required_cols:
-        if col not in working.columns:
-            working[col] = 0.0 if col != "Case" else ""
-    working["Case"] = working["Case"].astype(str).replace("nan", "")
-    for col in required_cols[1:]:
-        working[col] = pd.to_numeric(working[col], errors="coerce").fillna(0.0)
-    working = working[required_cols]
-    working = working[working["Case"].str.strip() != ""].reset_index(drop=True)
-    if working.empty:
-        working = default_load_cases()
-    return working
-
-
-def parse_available_bar_sizes(text: str) -> list[float]:
-    parsed: list[float] = []
-    for raw_item in text.split(","):
-        item = raw_item.strip()
-        if not item:
-            continue
-        try:
-            value = float(item)
-        except ValueError:
-            st.warning(f"'{item}' is not a valid bar diameter and was skipped.")
-            continue
-        if value <= 0.0:
-            st.warning(f"'{item}' must be greater than 0 and was skipped.")
-            continue
-        parsed.append(value)
-    return sorted(set(parsed))
-
-
-def json_ready(value):
-    if isinstance(value, pd.DataFrame):
-        return value.to_dict(orient="records")
-    return value
-
-
-def project_payload(data: dict) -> str:
-    return json.dumps({key: json_ready(value) for key, value in data.items()}, indent=2)
-
-
-st.set_page_config(page_title="Pile Reinforcement Designer", page_icon="P", layout="wide", initial_sidebar_state="expanded")
-
-st.title("Pile Reinforcement Designer")
-st.caption("Preliminary RC pile longitudinal reinforcement design for square, rectangular, and circular sections using strain compatibility interaction curves, true PMM checks, auto design, manual check, layout plots, and save/load workflow.")
-
-with st.sidebar:
-    st.markdown("### Save / Load Design")
-    default_state = {
-        "shape": "Square",
-        "width_mm": 300.0,
-        "depth_mm": 400.0,
-        "diameter_mm": 400.0,
-        "fc_mpa": 28.0,
-        "fy_mpa": 420.0,
-        "cover_mm": 50.0,
-        "tie_dia_mm": 9.0,
-        "column_type": "Tied",
-        "min_ratio_percent": 1.0,
-        "max_ratio_percent": 8.0,
-        "min_clear_spacing_mm": 40.0,
-        "mode": "Auto design",
-        "manual_bar_dia_mm": 20.0,
-        "bars_width_face": 4,
-        "bars_depth_face": 4,
-        "bars_circular": 8,
-        "available_sizes_text": "12, 16, 20, 25, 28, 32",
-        "load_cases": default_load_cases().to_dict(orient="records"),
-    }
-    payload = project_payload({key: st.session_state.get(key, value) for key, value in default_state.items()})
-    st.download_button("Save Project", payload, file_name="pile_rebar_design.json", mime="application/json", use_container_width=True)
-    uploaded = st.file_uploader("Open project JSON", type=["json"])
-    if uploaded is not None:
-        try:
-            loaded = json.loads(uploaded.getvalue().decode("utf-8"))
-            for key, value in loaded.items():
-                st.session_state[key] = value
-            st.success("Project file loaded.")
-        except Exception as exc:
-            st.error(f"Could not open project file: {exc}")
-
-    st.header("Design Basis")
-    code_basis = st.selectbox("Reference basis", ["Strain Compatibility PMM (ACI 318-19 style)"], index=0)
-    column_type = st.radio("Transverse reinforcement type", ["Tied", "Spiral"], horizontal=True, key="column_type")
-    min_ratio_percent = st.number_input("Minimum rho for auto (%)", min_value=0.1, max_value=8.0, step=0.1, key="min_ratio_percent")
-    max_ratio_percent = st.number_input("Maximum rho for auto (%)", min_value=1.0, max_value=12.0, step=0.1, key="max_ratio_percent")
-    min_clear_spacing_user_mm = st.number_input("Minimum clear spacing (mm)", min_value=25.0, max_value=200.0, step=5.0, key="min_clear_spacing_mm")
-    tie_dia_mm = st.number_input("Tie / spiral diameter (mm)", min_value=6.0, max_value=20.0, step=1.0, key="tie_dia_mm")
-    available_sizes_text = st.text_input("Available main bar diameters (mm)", key="available_sizes_text")
-
-    st.header("Geometry")
-    shape = st.selectbox("Pile cross-section", ["Square", "Rectangle", "Circular"], key="shape")
-    if shape == "Square":
-        width_mm = st.number_input("Width = Depth (mm)", min_value=150.0, step=25.0, key="width_mm")
-        depth_mm = width_mm
-        diameter_mm = None
-    elif shape == "Rectangle":
-        width_mm = st.number_input("Width b (mm)", min_value=150.0, step=25.0, key="width_mm")
-        depth_mm = st.number_input("Depth h (mm)", min_value=150.0, step=25.0, key="depth_mm")
-        diameter_mm = None
-    else:
-        diameter_mm = st.number_input("Diameter D (mm)", min_value=150.0, step=25.0, key="diameter_mm")
-        width_mm = None
-        depth_mm = None
-    cover_mm = st.number_input("Clear cover to tie / spiral (mm)", min_value=25.0, step=5.0, key="cover_mm")
-
-    st.header("Material and Load")
-    fc_mpa = st.number_input("Concrete strength f'c (MPa)", min_value=15.0, max_value=80.0, step=1.0, key="fc_mpa")
-    fy_mpa = st.number_input("Steel yield strength fy (MPa)", min_value=240.0, max_value=600.0, step=10.0, key="fy_mpa")
-
-    st.header("Reinforcement")
-    mode = st.radio("Reinforcement mode", ["Auto design", "Manual check"], horizontal=True, key="mode")
-    manual_bar_dia_mm = st.selectbox("Main bar diameter", DEFAULT_BAR_SIZES_MM, index=2, key="manual_bar_dia_mm")
-    if shape == "Circular":
-        bars_circular = st.number_input("Bars around perimeter", min_value=6, max_value=40, step=1, key="bars_circular")
-        bars_width_face = None
-        bars_depth_face = None
-    else:
-        bars_width_face = st.number_input("Bars on top/bottom faces", min_value=2, max_value=20, step=1, key="bars_width_face")
-        bars_depth_face = st.number_input("Bars on left/right faces", min_value=2, max_value=20, step=1, key="bars_depth_face")
-        bars_circular = None
-
-st.subheader("Internal Force Load Cases")
-if "load_cases" not in st.session_state:
-    st.session_state.load_cases = default_load_cases()
-edited_load_cases = st.data_editor(
-    clean_load_cases(pd.DataFrame(st.session_state.load_cases)),
-    num_rows="dynamic",
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Case": st.column_config.TextColumn("Case"),
-        "Pu (kN)": st.column_config.NumberColumn("Pu (kN)", step=50.0, format="%.1f"),
-        "Mx (kN-m)": st.column_config.NumberColumn("Mx (kN-m)", step=10.0, format="%.1f"),
-        "My (kN-m)": st.column_config.NumberColumn("My (kN-m)", step=10.0, format="%.1f"),
-    },
-    key="load_cases_editor",
+import pandas as pd
+
+# Streamlit reruns app.py in the same Python process. Reload the local
+# calculation module so newly-added presets are visible without a server restart.
+import stm_calculations as _stm_calculations
+_stm_calculations = importlib.reload(_stm_calculations)
+
+from stm_calculations import (
+    get_preset_layouts, get_truncated_triangle_equal,
+    validate_pile_spacing, compute_cap_bounds_per_side,
+    parse_custom_coords, stm_design,
+    check_rebar, suggest_rebar, REBAR_DB,
+    REBAR_FY, REBAR_DIAM_MM, FY_CAP_MPA,
+    compute_pile_reactions,
+    optimize_rebar, check_anchorage,
+    compute_top_reinforcement,
 )
-load_cases_df = clean_load_cases(pd.DataFrame(edited_load_cases))
-st.session_state.load_cases = load_cases_df.copy()
+def _cap_area_m2(cap_polygon, cap_lx, cap_ly):
+    """คำนวณพื้นที่ฐานราก (m²)
+    - มี cap_polygon (truncated triangle) → Shoelace formula (พื้นที่จริง)
+    - ไม่มี cap_polygon → Lx × Ly (bounding box)"""
+    if cap_polygon and len(cap_polygon) >= 3:
+        pts = cap_polygon
+        n = len(pts)
+        area = abs(sum(pts[i][0]*pts[(i+1)%n][1] -
+                       pts[(i+1)%n][0]*pts[i][1]
+                       for i in range(n))) / 2.0
+        return area / 1e6  # mm² → m²
+    return (cap_lx / 1000.0) * (cap_ly / 1000.0)
 
-geometry = section_geometry(shape, width_mm, depth_mm, diameter_mm)
-phi = phi_factor(column_type)
-axial_cap = axial_cap_factor(column_type)
-min_ratio = min_ratio_percent / 100.0
-max_ratio = max_ratio_percent / 100.0
-eccentricity_value = minimum_eccentricity_mm(geometry)
-bars_width_face_int = int(bars_width_face) if bars_width_face is not None else None
-bars_depth_face_int = int(bars_depth_face) if bars_depth_face is not None else None
-bars_circular_int = int(bars_circular) if bars_circular is not None else None
 
-available_sizes = parse_available_bar_sizes(available_sizes_text)
-if not available_sizes:
-    available_sizes = DEFAULT_BAR_SIZES_MM.copy()
-
-curve_x_manual = interaction_curve(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    phi=phi,
-    column_type=column_type,
-    axial_cap_factor_value=axial_cap,
-    axis="x",
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-curve_y_manual = interaction_curve(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    phi=phi,
-    column_type=column_type,
-    axial_cap_factor_value=axial_cap,
-    axis="y",
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-pmm_responses_true = rotated_pmm_responses(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    phi=phi,
-    column_type=column_type,
-    axial_cap_factor_value=axial_cap,
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-load_case_results_df, governing_case = evaluate_load_cases_true(load_cases_df, curve_x_manual, curve_y_manual, pmm_responses_true, eccentricity_value)
-pmm_required_ast_mm2, pmm_required_found = solve_required_ast_from_pmm(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    phi=phi,
-    column_type=column_type,
-    axial_cap_factor_value=axial_cap,
-    min_ratio=min_ratio,
-    max_ratio=max_ratio,
-    load_df=load_cases_df,
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-
-manual_result = analyze_manual_layout(
-    geometry=geometry,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    min_clear_spacing_user_mm=min_clear_spacing_user_mm,
-    phi=phi,
-    fc_mpa=fc_mpa,
-    fy_mpa=fy_mpa,
-    min_ratio=min_ratio,
-    max_ratio=max_ratio,
-    shape=shape,
-    axial_cap_factor_value=axial_cap,
-    ast_required_pmm_mm2=pmm_required_ast_mm2,
-    pmm_required_found=pmm_required_found,
-    governing_pu_kN=governing_case["pu"],
-    governing_case_name=governing_case["case"],
-    governing_ratio=governing_case["ratio"],
-    phi_mnx_at_pu_kNm=governing_case["mnx"],
-    phi_mny_at_pu_kNm=governing_case["mny"],
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-
-total_bars = layout_total_bars(shape, bars_width_face_int, bars_depth_face_int, bars_circular_int)
-ast_manual = total_bars * bar_area_mm2(float(manual_bar_dia_mm))
-required_ast_display = format_required_ast(manual_result.ast_required_mm2, manual_result.pmm_required_found, manual_result.ast_max_mm2)
-section_note = section_note_text(
-    shape=shape,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    total_bars=total_bars,
-    ast_mm2=ast_manual,
-    rho_percent=manual_result.steel_ratio_percent,
-    spacing_note=manual_result.spacing_note,
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-
-section_layout_fig = section_figure(
-    geometry=geometry,
-    shape=shape,
-    cover_mm=cover_mm,
-    tie_dia_mm=tie_dia_mm,
-    bar_dia_mm=float(manual_bar_dia_mm),
-    note_text=section_note,
-    bars_width_face=bars_width_face_int,
-    bars_depth_face=bars_depth_face_int,
-    bars_circular=bars_circular_int,
-)
-uniaxial_fig = interaction_plot_with_demand(curve_x_manual, curve_y_manual, governing_case["pu"], governing_case["mx"], governing_case["my"])
-pmm_slice_true_df = governing_case["contour"].copy() if isinstance(governing_case.get("contour"), pd.DataFrame) else pmm_slice_from_responses(pmm_responses_true, governing_case["pu"])
-pmm_true_ratio = governing_case["ratio"]
-pmm_slice_fig = pmm_slice_plot(
-    contour_df=pmm_slice_true_df,
-    pu_kN=governing_case["pu"],
-    mx_kNm=governing_case["mx"],
-    my_kNm=governing_case["my"],
-    ratio=pmm_true_ratio,
-)
-pmm_surface_fig = pmm_surface_plot(
-    responses=pmm_responses_true,
-    contour_df=pmm_slice_true_df,
-    pu_kN=governing_case["pu"],
-    mx_kNm=governing_case["mx"],
-    my_kNm=governing_case["my"],
-    ratio=pmm_true_ratio,
-)
-verification_df = run_verification_suite()
-
-result_cols = st.columns(7)
-result_cols[0].metric("Gross area Ag", f"{geometry.ag_mm2:,.0f} mm2")
-result_cols[1].metric("phi", f"{phi:.2f}")
-result_cols[2].metric("e_min", f"{manual_result.minimum_eccentricity_mm:.1f} mm")
-result_cols[3].metric("Required Ast from PMM", required_ast_display)
-result_cols[4].metric("Provided Ast", f"{ast_manual:,.1f} mm2")
-result_cols[5].metric("Steel ratio", f"{manual_result.steel_ratio_percent:.3f} %")
-result_cols[6].metric("Governing PMM ratio", f"{manual_result.governing_ratio:.3f}")
-
-if mode == "Auto design":
-    with st.spinner("Searching reinforcement layout..."):
-        options_df = auto_design_options(
-            geometry=geometry,
-            cover_mm=cover_mm,
-            tie_dia_mm=tie_dia_mm,
-            fc_mpa=fc_mpa,
-            fy_mpa=fy_mpa,
-            phi=phi,
-            column_type=column_type,
-            min_ratio=min_ratio,
-            max_ratio=max_ratio,
-            min_clear_spacing_user_mm=min_clear_spacing_user_mm,
-            shape=shape,
-            bar_sizes_mm=available_sizes,
-            load_df=load_cases_df,
-            axial_cap_factor_value=axial_cap,
-        )
-else:
-    options_df = pd.DataFrame()
-
-tabs = st.tabs(["Results", "Section", "Interaction", "Verification", "Method"])
-
-with tabs[0]:
-    status_text = "OK" if manual_result.overall_ok else "NG"
-    st.subheader("Manual Check Summary")
-    summary_df = pd.DataFrame(
-        [
-            ["Status", status_text, ""],
-            ["Governing case", manual_result.governing_load_case, ""],
-            ["PMM ratio", f"{manual_result.governing_ratio:,.3f}", "<= 1.0 required"],
-            ["Spacing check", "Pass" if manual_result.spacing_ok else "Fail", manual_result.spacing_note],
-            ["Required Ast from PMM", required_ast_display, "Equivalent steel area for the current layout pattern"],
-            ["PMM requirement status", "Solved within rho_max" if manual_result.pmm_required_found else "Exceeds rho_max", ""],
-            ["Axial starter Ast", f"{manual_result.ast_axial_starter_mm2:,.1f}", "mm2"],
-            ["Ast from equation", f"{manual_result.ast_from_equation_mm2:,.1f}", "mm2"],
-            ["Ast minimum", f"{manual_result.ast_min_mm2:,.1f}", "mm2"],
-            ["Ast maximum", f"{manual_result.ast_max_mm2:,.1f}", "mm2"],
-            ["Ast provided", f"{ast_manual:,.1f}", "mm2"],
-            ["Minimum eccentricity", f"{manual_result.minimum_eccentricity_mm:,.1f}", "mm"],
-            ["Minimum moment floor at Pu", f"{governing_case['m_min']:,.1f}", "kN-m"],
-            ["Mx input governing", f"{governing_case['mx_input']:,.1f}", "kN-m"],
-            ["My input governing", f"{governing_case['my_input']:,.1f}", "kN-m"],
-            ["Mx used in PMM", f"{governing_case['mx']:,.1f}", "kN-m"],
-            ["My used in PMM", f"{governing_case['my']:,.1f}", "kN-m"],
-            ["Minimum eccentricity applied", "Yes" if governing_case["min_ecc_applied"] else "No", ""],
-            ["phi Mnx at governing Pu", f"{manual_result.phi_mnx_at_pu_kNm:,.1f}", "kN-m"],
-            ["phi Mny at governing Pu", f"{manual_result.phi_mny_at_pu_kNm:,.1f}", "kN-m"],
-            ["phi Pn", f"{manual_result.phi_pn_kN:,.1f}", "kN"],
-            ["Axial cap factor", f"{axial_cap:.2f}", "ACI compression limit"],
-            ["Pu governing", f"{governing_case['pu']:,.1f}", "kN"],
-        ],
-        columns=["Item", "Value", "Unit / Note"],
-    )
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
-    st.subheader("Internal Force Cases")
-    st.dataframe(load_case_results_df, use_container_width=True, hide_index=True)
-
-    if mode == "Auto design":
-        st.subheader("Auto Design Options")
-        if options_df.empty:
-            st.warning("No feasible layout found from the selected bar sizes and spacing limits.")
-        else:
-            st.dataframe(options_df, use_container_width=True, hide_index=True)
-            best = options_df.iloc[0]
-            st.info(
-                f"Suggested starting option: {int(best['Total bars'])} bars, DB{int(best['Bar size (mm)'])}, "
-                f"{best['Arrangement']}, Ast = {best['Ast provided (mm2)']:,.1f} mm2"
-            )
-
-with tabs[1]:
-    top_left, top_right = st.columns(2)
-    with top_left:
-        st.plotly_chart(section_layout_fig, use_container_width=True)
-    with top_right:
-        st.plotly_chart(uniaxial_fig, use_container_width=True)
-
-    st.subheader("Minimum Reinforcement Check")
-    min_check_df = pd.DataFrame(
-        [
-            ["Minimum Ast required", f"{manual_result.ast_min_mm2:,.1f} mm2", "From minimum rho setting"],
-            ["Provided Ast", f"{ast_manual:,.1f} mm2", "Current layout"],
-            ["Overall status", "OK" if ast_manual >= manual_result.ast_min_mm2 else "NG", "Minimum reinforcement check"],
-        ],
-        columns=["Check", "Value", "Note"],
-    )
-    st.dataframe(min_check_df, use_container_width=True, hide_index=True)
-    st.plotly_chart(pmm_slice_fig, use_container_width=True)
-    st.plotly_chart(pmm_surface_fig, use_container_width=True, key="pmm_3d_surface")
-
-with tabs[2]:
-    left, right = st.columns(2)
-    with left:
-        st.plotly_chart(axial_capacity_plot(manual_result, governing_case["pu"]), use_container_width=True)
-    with right:
-        st.plotly_chart(interaction_plot(curve_x_manual, curve_y_manual, governing_case["pu"]), use_container_width=True)
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    ["Max phi Pn from x-curve", f"{curve_x_manual['phi_pn_kN'].max():,.1f}", "kN"],
-                    ["phi Mnx at governing Pu", f"{manual_result.phi_mnx_at_pu_kNm:,.1f}", "kN-m"],
-                    ["Max phi Pn from y-curve", f"{curve_y_manual['phi_pn_kN'].max():,.1f}", "kN"],
-                    ["phi Mny at governing Pu", f"{manual_result.phi_mny_at_pu_kNm:,.1f}", "kN-m"],
-                ],
-                columns=["Interaction item", "Value", "Unit"],
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-with tabs[3]:
-    st.subheader("Verification Benchmarks")
-    st.dataframe(verification_df, use_container_width=True, hide_index=True)
-    st.caption("These are built-in sanity checks for square, rectangular, and circular benchmark sections. They help confirm symmetry, intercept consistency, and rotational behavior, but they do not replace an external hand-check or certified design software benchmark.")
-
-with tabs[4]:
+def _formula_box(text):
+    """Render formula text without Streamlit's dynamic syntax highlighter."""
+    safe = (str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
     st.markdown(
-        f"""
-        **Workflow intentionally modeled after the reference app**
+        (
+            '<div style="font-family: ui-monospace, SFMono-Regular, Menlo, '
+            'Consolas, Liberation Mono, monospace; white-space: pre-wrap; '
+            'background:#f8fafc; border:1px solid #e2e8f0; '
+            'border-radius:6px; padding:0.65rem 0.75rem; '
+            'color:#0f172a; font-size:0.92rem; line-height:1.45;">'
+            '{}</div>'
+        ).format(safe),
+        unsafe_allow_html=True)
 
-        - Sidebar-first input flow with grouped sections for `Design Basis`, `Geometry`, `Material and Load`, and `Reinforcement`
-        - Editable table for internal force load cases: `Pu`, `Mx`, `My`
-        - `Auto design` and `Manual check` modes
-        - Save/load project state with JSON
-        - Result metrics, summary tables, dedicated `Section` and `Interaction` tabs, and transparent calculation notes
 
-        **Current design basis**
+def _rebar_spacing_text(n_bars, distribution_width_mm, cap_lx_mm, cap_ly_mm,
+                        cover_mm):
+    """Estimate center-to-center spacing used for plan rebar layout."""
+    n = int(n_bars)
+    if n <= 1:
+        return "—"
+    edge_inset = min(max(float(cover_mm), 25.0),
+                     0.45 * min(float(cap_lx_mm), float(cap_ly_mm)))
+    usable_width = max(0.0, float(distribution_width_mm) - 2.0 * edge_inset)
+    return "{:.0f}".format(usable_width / (n - 1))
 
-        - Main section checks use `strain compatibility PMM`, not a simplified load contour
-        - ACI axial compression cap is still enforced on the compression end:
-          `phi Pn,max = cap x phi x [0.85 f'c (Ag - Ast) + fy Ast]`
-        - `cap = 0.80` for tied columns and `0.85` for spiral columns
-        - The app still computes an axial starter steel estimate from:
-          `Ast = (Pu/(cap x phi) - 0.85 f'c Ag) / (fy - 0.85 f'c)`
-        - The axial starter is used only as a screening and reporting value:
-          `Ast starter = max(Ast from equation, Ast minimum, 0)`
-        - Steel ratio limits:
-          `rho_min = {min_ratio_percent:.2f}%`
-          `rho_max = {max_ratio_percent:.2f}%`
 
-        **Layout logic**
+def _ensure_top_rebar_schedule(tr, cap_lx_mm, cap_ly_mm, cover_mm):
+    """Backfill top-bar detailing schedule if result dict lacks it.
 
-        - Rectangular sections use perimeter-bar style input:
-          `bars on top/bottom` and `bars on left/right`
-        - Total bars for rectangular sections:
-          `n = 2 * bars_width_face + 2 * (bars_depth_face - 2)`
-        - Circular sections place bars uniformly around the perimeter
-        - Minimum spacing check uses the largest of user input, `1.5db`, and `40 mm`
+    This keeps the UI/report robust when a rerun has old session data or a
+    deployment briefly serves mixed app/calculation modules.
+    """
+    bar = tr.get("top_bar_size", "DB20")
+    A_bar = REBAR_DB.get(bar, REBAR_DB["DB20"])
+    db = tr.get("db_top_mm", REBAR_DIAM_MM.get(bar, 20.0))
+    s_max = float(tr.get("s_max_top_mm", min(3.0 * float(cap_ly_mm), 450.0)))
+    edge_inset = tr.get("top_edge_inset_mm")
+    if edge_inset is None:
+        edge_inset = min(max(float(cover_mm), float(db)),
+                         0.45 * min(float(cap_lx_mm), float(cap_ly_mm)))
+    usable_x = max(0.0, float(cap_lx_mm) - 2.0 * edge_inset)
+    usable_y = max(0.0, float(cap_ly_mm) - 2.0 * edge_inset)
 
-        **Strain compatibility interaction engine**
+    def _schedule(As_req, distribution_width):
+        n_area = max(2, int(math.ceil(As_req / A_bar))) if As_req > 0 else 2
+        n_spacing = (
+            max(2, int(math.ceil(distribution_width / s_max)) + 1)
+            if s_max > 0 else n_area)
+        n = max(n_area, n_spacing)
+        spacing = distribution_width / (n - 1) if n > 1 else 0.0
+        return n, spacing, n * A_bar, n_area, n_spacing
 
-        - Square, rectangular, and circular sections all generate uniaxial `P-Mx` and `P-My` curves using strain compatibility
-        - Concrete compression is integrated over the compression zone with `0.85f'c`
-        - Steel stress is computed from strain using `Es = 200,000 MPa` and capped at `fy`
-        - Bars inside the compression block use net steel stress `(fs - 0.85f'c)` to avoid double counting displaced concrete
-        - Uniaxial curves use strain-based `phi` transition between compression-controlled and tension-controlled behavior
-        - The compression end of the uniaxial curve is capped to the ACI axial compression limit for tied/spiral columns
-
-        **Biaxial bending check**
-
-        - Every load case in the input table is checked against the true rotated-neutral-axis PMM surface
-        - At each `Pu`, the app also interpolates `phi Mnx(Pu)` and `phi Mny(Pu)` for reference reporting
-        - Minimum eccentricity is enforced as `Mmin = Pu x e_min`
-        - `e_min = 0.1D` for circular sections and `0.1 x min(b, h)` for square/rectangular sections in the current implementation
-        - If user-entered `Mx, My` are smaller than `Mmin`, the app scales the moment vector up to the minimum required magnitude before the PMM check
-        - The worst adjusted load case becomes the governing case for summary and auto design
-        - The `Section` tab now shows:
-          base reinforcement plot, uniaxial interaction curves with demand markers, `PMM Mux-My` slice at governing `Pu`, and a 3D interaction surface with the load point
-
-        **Required steel reporting**
-
-        - `Required Ast from PMM` is solved iteratively for the current layout pattern by increasing or reducing the equivalent total steel area until the governing PMM ratio reaches `1.0`
-        - This PMM-required steel value is an equivalent area for the current bar pattern and bar centroids
-        - `Axial starter Ast` remains visible as a quick screening value, but it is no longer the pass/fail criterion
-
-        **Engineering note**
-
-        - App status is now governed by spacing, steel ratio bounds, and true PMM utilization, instead of mixing axial-only and PMM-only criteria
-        - The summary governing ratio, the `Section` tab PMM slice, the 3D surface, and auto-design screening all use the same PMM engine
-        - `phi Pn` remains useful as a compression reference value, but it is no longer treated as a separate duplicate pass/fail gate
-        - Final design should still verify the governing code, moment effects, slenderness, confinement, pile driving or precast detailing limits, splice/development, and project-specific requirements
-        """
+    x_n, x_spacing, x_As, x_n_area, x_n_spacing = _schedule(
+        float(tr.get("As_top_x_mm2", 0.0)), usable_y)
+    y_n, y_spacing, y_As, y_n_area, y_n_spacing = _schedule(
+        float(tr.get("As_top_y_mm2", 0.0)), usable_x)
+    x_valid = (
+        int(tr.get("top_x_n_bars") or 0) >= 2 and
+        float(tr.get("top_x_spacing_mm") or 0.0) > 0.0 and
+        float(tr.get("top_x_As_provided_mm2") or 0.0) > 0.0
     )
+    y_valid = (
+        int(tr.get("top_y_n_bars") or 0) >= 2 and
+        float(tr.get("top_y_spacing_mm") or 0.0) > 0.0 and
+        float(tr.get("top_y_As_provided_mm2") or 0.0) > 0.0
+    )
+
+    tr.update({
+        "top_bar_area_mm2": A_bar,
+        "top_edge_inset_mm": edge_inset,
+        "top_usable_x_mm": usable_x,
+        "top_usable_y_mm": usable_y,
+        "top_x_n_bars": int(tr.get("top_x_n_bars") if x_valid else x_n),
+        "top_y_n_bars": int(tr.get("top_y_n_bars") if y_valid else y_n),
+        "top_x_spacing_mm": float(tr.get("top_x_spacing_mm") if x_valid else x_spacing),
+        "top_y_spacing_mm": float(tr.get("top_y_spacing_mm") if y_valid else y_spacing),
+        "top_x_As_provided_mm2": float(tr.get("top_x_As_provided_mm2") if x_valid else x_As),
+        "top_y_As_provided_mm2": float(tr.get("top_y_As_provided_mm2") if y_valid else y_As),
+        "top_x_n_area": int(tr.get("top_x_n_area") if x_valid else x_n_area),
+        "top_y_n_area": int(tr.get("top_y_n_area") if y_valid else y_n_area),
+        "top_x_n_spacing": int(tr.get("top_x_n_spacing") if x_valid else x_n_spacing),
+        "top_y_n_spacing": int(tr.get("top_y_n_spacing") if y_valid else y_n_spacing),
+    })
+    return tr
+
+
+def _check_anchorage_with_mode(bar_size, fc, fy_mpa,
+                               available_straight_mm,
+                               available_edge_hook_mm,
+                               mode, available_vertical_hook_mm):
+    """Call check_anchorage without new kwargs for deployment compatibility."""
+    use_vertical = str(mode).startswith("90")
+    hook_avail = (
+        available_vertical_hook_mm if use_vertical
+        else available_edge_hook_mm
+    )
+    out = check_anchorage(
+        bar_size, fc, fy_mpa, available_straight_mm, hook_avail)
+    out["anchorage_mode"] = mode
+    out["available_edge_hook_mm"] = available_edge_hook_mm
+    out["available_vertical_hook_mm"] = (
+        available_vertical_hook_mm if use_vertical else None
+    )
+    out["available_hook_mm"] = hook_avail
+    if use_vertical:
+        if out.get("straight_ok"):
+            out["recommended"] = "Straight bar OK"
+        elif out.get("hook_ok"):
+            out["recommended"] = "90° vertical hook OK"
+        else:
+            out["recommended"] = (
+                "INSUFFICIENT — increase cap thickness or lower bottom bar"
+            )
+    return out
+
+
+def _design_force_summary_rows(results):
+    """Summarize the force demands actually used by the design checks."""
+    rows = []
+    struts = results.get("struts", [])
+    if struts:
+        gov_idx, gov_strut = max(
+            enumerate(struts, 1),
+            key=lambda item: item[1].get("F_strut_kN", 0.0))
+        rows.append({
+            "Component": "Strut compression",
+            "Governing member / path": "S{} to P{}".format(gov_idx, gov_idx),
+            "Design force (kN)": "{:.1f}".format(
+                results.get("F_strut_max_kN",
+                            gov_strut.get("F_strut_kN", 0.0))),
+            "Used for": "Strut capacity DCR",
+            "Notes": "max F_strut among all struts",
+        })
+
+    if results.get("is_3pile_resultant"):
+        rows.append({
+            "Component": "Tie resultant",
+            "Governing member / path": "3-pile resultant",
+            "Design force (kN)": "{:.1f}".format(
+                results.get("F_tie_res_kN", 0.0)),
+            "Used for": "Bottom X/Y As_STM",
+            "Notes": "coordinate-rotation independent resultant",
+        })
+    else:
+        rows.extend([
+            {
+                "Component": "Tie X direction",
+                "Governing member / path": "max left/right tie demand",
+                "Design force (kN)": "{:.1f}".format(
+                    results.get("F_tie_x_design_kN",
+                                results.get("F_tie_x_max_kN", 0.0))),
+                "Used for": "Bottom X As_STM",
+                "Notes": results.get("As_x_governs", ""),
+            },
+            {
+                "Component": "Tie Y direction",
+                "Governing member / path": "max front/back tie demand",
+                "Design force (kN)": "{:.1f}".format(
+                    results.get("F_tie_y_design_kN",
+                                results.get("F_tie_y_max_kN", 0.0))),
+                "Used for": "Bottom Y As_STM",
+                "Notes": results.get("As_y_governs", ""),
+            },
+        ])
+    return rows
+
+
+def _strut_force_rows(results):
+    """Return per-strut forces for the 3D-view force table."""
+    rows = []
+    for i, s in enumerate(results.get("struts", []), 1):
+        node_x, node_y = s.get("column_coord", (0.0, 0.0))
+        rows.append({
+            "Strut": "S{}".format(i),
+            "Pile": "P{}".format(i),
+            "Top node X (mm)": "{:.0f}".format(node_x),
+            "Top node Y (mm)": "{:.0f}".format(node_y),
+            "P_i (kN)": "{:.1f}".format(s.get("P_i_kN", 0.0)),
+            "F_strut (kN)": "{:.1f}".format(s.get("F_strut_kN", 0.0)),
+            "θ (deg)": "{:.1f}".format(s.get("theta_deg", 0.0)),
+            "Tie comp X (kN)": "{:.1f}".format(
+                s.get("F_tie_x_kN", 0.0)),
+            "Tie comp Y (kN)": "{:.1f}".format(
+                s.get("F_tie_y_kN", 0.0)),
+        })
+    return rows
+
+
+def _pile_head_force_rows(results):
+    """Return pile-head actions transferred from the pile cap STM model."""
+    data = []
+    rows = []
+    struts = results.get("struts", [])
+    for i, s in enumerate(struts, 1):
+        pile_x, pile_y = s.get("coord", (0.0, 0.0))
+        node_x, node_y = s.get("column_coord", (0.0, 0.0))
+        axial = float(s.get("P_i_kN", 0.0))
+        hx_mag = float(s.get("F_tie_x_kN", 0.0))
+        hy_mag = float(s.get("F_tie_y_kN", 0.0))
+        dx = float(s.get("dx_from_col", pile_x - node_x))
+        dy = float(s.get("dy_from_col", pile_y - node_y))
+        hx = math.copysign(hx_mag, dx) if abs(dx) > 1e-9 else 0.0
+        hy = math.copysign(hy_mag, dy) if abs(dy) > 1e-9 else 0.0
+        h_res = math.hypot(hx, hy)
+        strut_force = float(s.get("F_strut_kN", 0.0))
+        theta = float(s.get("theta_deg", 0.0))
+        note = "Compression pile"
+        if axial < -1e-3:
+            note = "Uplift/tension pile - strut ignored in STM"
+        elif abs(axial) <= 1e-3:
+            note = "Near-zero axial"
+        item = {
+            "idx": i,
+            "pile": "P{}".format(i),
+            "x": pile_x,
+            "y": pile_y,
+            "node_x": node_x,
+            "node_y": node_y,
+            "axial": axial,
+            "hx": hx,
+            "hy": hy,
+            "h_res": h_res,
+            "strut": strut_force,
+            "theta": theta,
+            "note": note,
+        }
+        data.append(item)
+        rows.append({
+            "Pile": item["pile"],
+            "X (mm)": "{:.0f}".format(pile_x),
+            "Y (mm)": "{:.0f}".format(pile_y),
+            "Top node X (mm)": "{:.0f}".format(node_x),
+            "Top node Y (mm)": "{:.0f}".format(node_y),
+            "Axial P_i (kN)": "{:.1f}".format(axial),
+            "H_x (kN)": "{:.1f}".format(hx),
+            "H_y (kN)": "{:.1f}".format(hy),
+            "H resultant (kN)": "{:.1f}".format(h_res),
+            "F_strut (kN)": "{:.1f}".format(strut_force),
+            "θ (deg)": "{:.1f}".format(theta),
+            "Note": note,
+        })
+
+    summary = []
+    if data:
+        max_comp = max(data, key=lambda item: item["axial"])
+        min_axial = min(data, key=lambda item: item["axial"])
+        max_h = max(data, key=lambda item: item["h_res"])
+        max_hx = max(data, key=lambda item: abs(item["hx"]))
+        max_hy = max(data, key=lambda item: abs(item["hy"]))
+        max_strut = max(data, key=lambda item: item["strut"])
+
+        summary.append({
+            "Critical action": "Max axial compression",
+            "Pile": max_comp["pile"],
+            "Design value": "{:.1f} kN".format(max_comp["axial"]),
+            "Use for": "Pile axial compression design",
+        })
+        if min_axial["axial"] < -1e-3:
+            summary.append({
+                "Critical action": "Max uplift / tension",
+                "Pile": min_axial["pile"],
+                "Design value": "{:.1f} kN tension".format(
+                    abs(min_axial["axial"])),
+                "Use for": "Tension pile, anchorage, connection check",
+            })
+        summary.extend([
+            {
+                "Critical action": "Max horizontal resultant",
+                "Pile": max_h["pile"],
+                "Design value": "{:.1f} kN".format(max_h["h_res"]),
+                "Use for": "Pile-head shear / dowel reinforcement",
+            },
+            {
+                "Critical action": "Max |H_x|",
+                "Pile": max_hx["pile"],
+                "Design value": "{:.1f} kN".format(abs(max_hx["hx"])),
+                "Use for": "Pile-head shear in X direction",
+            },
+            {
+                "Critical action": "Max |H_y|",
+                "Pile": max_hy["pile"],
+                "Design value": "{:.1f} kN".format(abs(max_hy["hy"])),
+                "Use for": "Pile-head shear in Y direction",
+            },
+            {
+                "Critical action": "Max strut compression",
+                "Pile": max_strut["pile"],
+                "Design value": "{:.1f} kN".format(max_strut["strut"]),
+                "Use for": "Pile-head compression bearing / STM node",
+            },
+        ])
+    return rows, summary
+
+
+def _signed_strut_component(struts, idx, axis):
+    if idx >= len(struts):
+        return 0.0
+    s = struts[idx]
+    if axis == "x":
+        comp = abs(float(s.get("F_tie_x_kN", 0.0)))
+        delta = float(s.get("dx_from_col", 0.0))
+    else:
+        comp = abs(float(s.get("F_tie_y_kN", 0.0)))
+        delta = float(s.get("dy_from_col", 0.0))
+    if abs(delta) <= 1e-9:
+        return 0.0
+    return math.copysign(comp, delta)
+
+
+def _tie_member_rows(coords, results):
+    """Return tie labels, endpoints, and estimated member forces.
+
+    Forces are for the displayed tie paths and are estimated from cut
+    equilibrium of the local strut horizontal components in the same row or
+    column. The governing design forces remain the Tx/Ty summary above.
+    """
+    rows = []
+    struts = results.get("struts", [])
+    for tie_idx, (i, j) in enumerate(tie_pairs_for_3d_view(coords), 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[j]
+        if abs(y1 - y2) <= 1.0:
+            direction = "X tie path"
+            cut = (x1 + x2) / 2.0
+            row_ids = [
+                k for k, (_x, _y) in enumerate(coords)
+                if abs(_y - y1) <= 1.0
+            ]
+            left = sum(
+                _signed_strut_component(struts, k, "x")
+                for k in row_ids if coords[k][0] <= cut
+            )
+            right = sum(
+                _signed_strut_component(struts, k, "x")
+                for k in row_ids if coords[k][0] > cut
+            )
+            force = max(abs(left), abs(right))
+            basis = "X cut at x={:.0f} mm".format(cut)
+        elif abs(x1 - x2) <= 1.0:
+            direction = "Y tie path"
+            cut = (y1 + y2) / 2.0
+            col_ids = [
+                k for k, (_x, _y) in enumerate(coords)
+                if abs(_x - x1) <= 1.0
+            ]
+            lower = sum(
+                _signed_strut_component(struts, k, "y")
+                for k in col_ids if coords[k][1] <= cut
+            )
+            upper = sum(
+                _signed_strut_component(struts, k, "y")
+                for k in col_ids if coords[k][1] > cut
+            )
+            force = max(abs(lower), abs(upper))
+            basis = "Y cut at y={:.0f} mm".format(cut)
+        else:
+            direction = "Diagonal tie path"
+            force = results.get("F_tie_res_kN", 0.0)
+            basis = "3-pile resultant"
+        rows.append({
+            "Tie": "T{}".format(tie_idx),
+            "From": "P{}".format(i + 1),
+            "To": "P{}".format(j + 1),
+            "Path": direction,
+            "Tie force (kN)": "{:.1f}".format(force),
+            "Basis": basis,
+        })
+    return rows
+
+
+def _design_recommendations(results, x_chk=None, y_chk=None,
+                            anch_x=None, anch_y=None,
+                            opt_x=None, opt_y=None, cover=75.0):
+    recs = []
+
+    def add(issue, reason, action):
+        recs.append({"Issue": issue, "Why": reason, "Recommended adjustment": action})
+
+    if results.get("strut_DCR", 0.0) > 1.0:
+        dcr = results["strut_DCR"]
+        add(
+            "Strut compression",
+            "Strut DCR = {:.2f} > 1.00".format(dcr),
+            "Increase pile size/strut bearing area or concrete strength; "
+            "also consider increasing cap thickness or adding piles to reduce pile reactions.")
+
+    if results.get("bearing_DCR", 0.0) > 1.0:
+        dcr = results["bearing_DCR"]
+        add(
+            "Pile nodal bearing",
+            "Bearing DCR = {:.2f} > 1.00".format(dcr),
+            "Increase pile head area, concrete strength, or number of piles; "
+            "move the column/load point closer to the pile-group centroid if eccentricity is high.")
+
+    if results.get("column_DCR", 0.0) > 1.0:
+        dcr = results["column_DCR"]
+        add(
+            "Column nodal bearing",
+            "Column DCR = {:.2f} > 1.00".format(dcr),
+            "Increase column size or concrete strength, or reduce factored column load.")
+
+    if not results.get("angle_OK", True):
+        bad = [s for s in results.get("struts", []) if s.get("theta_deg", 90.0) < 25.0]
+        if bad:
+            import math
+            req_d = max(s["L_h"] * math.tan(math.radians(25.0)) for s in bad)
+            req_h = req_d + cover + 12.5
+            action = ("Increase cap thickness to about {:.0f} mm or more, "
+                      "or reduce horizontal strut length by moving piles/column closer.").format(req_h)
+        else:
+            action = "Increase cap thickness or reduce pile-to-column horizontal distance."
+        if results.get("stm_model_type") == "Point Column STM":
+            action += (" For a long wall/abutment support, review whether "
+                       "Wall/Abutment STM is the appropriate model before "
+                       "increasing geometry solely to satisfy the angle.")
+        add(
+            "Strut angle",
+            "Minimum strut angle = {:.1f} deg < 25 deg".format(
+                results.get("min_strut_angle_deg", 0.0)),
+            action)
+
+    if results.get("has_uplift", False):
+        add(
+            "Uplift",
+            "Minimum pile reaction P_min = {:.1f} kN".format(
+                results.get("P_min_kN", 0.0)),
+            "Provide tension pile/anchorage, add piles on the uplift side, "
+            "reduce moment/eccentricity, or move the column/load point closer to the pile-group centroid.")
+
+    if not results.get("reaction_equilibrium_OK", True):
+        add(
+            "Reaction equilibrium",
+            "The pile layout cannot resist the applied load/moment with available lever arms.",
+            "Add pile rows/columns in the missing lever-arm direction, revise custom coordinates, "
+            "or move the column/load point back inside the effective pile group.")
+
+    if x_chk is not None and not x_chk.get("ok", True):
+        if opt_x:
+            action = "Use at least {}-{} in X direction, or increase bar count/size.".format(
+                opt_x["n_bars"], opt_x["bar_size"])
+        else:
+            action = "Increase X-direction bar count or select a larger bar size."
+        add(
+            "Bottom tie steel X",
+            "Provided As ratio = {:.2f}; governing demand = {}".format(
+                x_chk.get("ratio", 0.0), results.get("As_x_governs", "—")),
+            action)
+
+    if y_chk is not None and not y_chk.get("ok", True):
+        if opt_y:
+            action = "Use at least {}-{} in Y direction, or increase bar count/size.".format(
+                opt_y["n_bars"], opt_y["bar_size"])
+        else:
+            action = "Increase Y-direction bar count or select a larger bar size."
+        add(
+            "Bottom tie steel Y",
+            "Provided As ratio = {:.2f}; governing demand = {}".format(
+                y_chk.get("ratio", 0.0), results.get("As_y_governs", "—")),
+            action)
+
+    if anch_x is not None and not anch_x.get("ok", True):
+        if str(anch_x.get("anchorage_mode", "")).startswith("90"):
+            action = ("Increase cap thickness, lower the bottom-bar layer if "
+                      "pile-head embedment/detailing permits, use a smaller "
+                      "bar, or provide a qualified headed/mechanical anchor.")
+        else:
+            action = ("Increase cap edge distance in X, use standard hooks/"
+                      "headed bars, or use smaller diameter bars.")
+        add(
+            "Anchorage X",
+            "Available development length is less than required.",
+            action)
+
+    if anch_y is not None and not anch_y.get("ok", True):
+        if str(anch_y.get("anchorage_mode", "")).startswith("90"):
+            action = ("Increase cap thickness, lower the bottom-bar layer if "
+                      "pile-head embedment/detailing permits, use a smaller "
+                      "bar, or provide a qualified headed/mechanical anchor.")
+        else:
+            action = ("Increase cap edge distance in Y, use standard hooks/"
+                      "headed bars, or use smaller diameter bars.")
+        add(
+            "Anchorage Y",
+            "Available development length is less than required.",
+            action)
+
+    if not recs and not results.get("overall_OK", True):
+        add(
+            "Design status",
+            "The design is marked FAIL but no single dominant trigger was isolated.",
+            "Review the Detail tab; check spacing, uplift, selected reinforcement, anchorage, and load direction.")
+
+    return recs
+
+
+import stm_visualization as _stm_visualization
+_stm_visualization = importlib.reload(_stm_visualization)
+
+from stm_visualization import (
+    plot_layout_preview, plot_plan_view,
+    plot_elevation, plot_rebar_layout, plot_3d_view,
+    plot_top_rebar_layout, tie_pairs_for_3d_view,
+)
+from report_generator import generate_report
+
+st.set_page_config(page_title="STM Pile Cap Designer",
+                   layout="wide", page_icon="🏗️")
+
+st.markdown(
+    """
+    <style>
+    div[data-testid="stTabs"] div[data-baseweb="tab-list"] {
+        gap: 0.35rem;
+        flex-wrap: wrap;
+        border-bottom: 2px solid #cbd5e1;
+        padding: 0.25rem 0 0.45rem 0;
+        margin-bottom: 0.75rem;
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"] {
+        height: 2.65rem;
+        padding: 0 0.95rem;
+        border: 1px solid #d7dee8;
+        border-bottom-color: #cbd5e1;
+        border-radius: 8px 8px 0 0;
+        background: #f8fafc;
+        color: #334155;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+        transition: background 120ms ease, border-color 120ms ease,
+                    color 120ms ease, box-shadow 120ms ease;
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"] p {
+        font-size: 0.96rem;
+        font-weight: 650;
+        line-height: 1.1;
+        white-space: nowrap;
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"]:hover {
+        background: #eef6ff;
+        border-color: #93c5fd;
+        color: #0f4c81;
+        box-shadow: 0 2px 6px rgba(15, 23, 42, 0.12);
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {
+        background: #0f4c81;
+        border-color: #0f4c81;
+        color: #ffffff;
+        box-shadow: 0 3px 10px rgba(15, 76, 129, 0.25);
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] p {
+        color: #ffffff;
+        font-weight: 750;
+    }
+
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"]::after {
+        background-color: #f59e0b;
+        height: 4px;
+        border-radius: 999px 999px 0 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True)
+
+# --------- Session-state defaults (for save/load) ---------
+DEFAULTS = {
+    "fc": 28.0, "fy": 420.0, "cover": 75,
+    "Pu": 5000.0, "Mux": 0.0, "Muy": 0.0,
+    "col_size": 500, "D": 600, "h_cap": 900,
+    "col_section": "Square",
+    "col_bx": 500.0, "col_by": 500.0, "col_diam": 500.0,
+    "col_x": 0.0, "col_y": 0.0,
+    "stm_model_type": "Point Column STM",
+    "pile_section": "Circular",
+    "pile_bx": 600.0, "pile_by": 600.0, "pile_diam": 600.0,
+    "preset_choice": "4-Pile (Square)",
+    "spacing_factor": 2.5,  # Legacy save/load key.
+    "spacing_factor_x": 2.5, "spacing_factor_y": 2.5,
+    "adv_spacing": False,
+    "sf_x": 2.5, "sf_y": 2.5, "clear_min": 500.0,
+    "e_left": 450.0, "e_right": 450.0,
+    "e_top": 450.0, "e_bot": 450.0,
+    "L_side": 4000, "w_trunc": 600, "e_trunc": 450.0,
+    "custom_text": "1500,1500\n-1500,1500\n-1500,-1500\n1500,-1500",
+    "custom_shape": "Square",
+    "x_bar": "DB20", "x_n": 8,
+    "y_bar": "DB20", "y_n": 8,
+    "anchorage_mode": "90° Vertical Hook",
+    "anchorage_bottom_z": 150.0,
+    "top_bar_size": "DB20",
+    "show_3d_force_labels": True,
+    "wcap_uls_factor": 1.2,
+}
+_had_spacing_x = "spacing_factor_x" in st.session_state
+_had_spacing_y = "spacing_factor_y" in st.session_state
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+if not _had_spacing_x:
+    st.session_state.spacing_factor_x = st.session_state.spacing_factor
+if not _had_spacing_y:
+    st.session_state.spacing_factor_y = st.session_state.spacing_factor
+
+st.title("🏗️ STM Pile Cap Designer")
+st.caption("Strut-and-Tie Method - ACI 318-19 / CRSI Design Handbook")
+
+# --------- Save / Load JSON ---------
+with st.sidebar:
+    st.subheader("💾 Save / Load Design")
+    sl1, sl2 = st.columns(2)
+    state_for_save = {k: st.session_state[k] for k in DEFAULTS}
+    _save_sfx = float(st.session_state.get("spacing_factor_x", 2.5))
+    _save_sfy = float(st.session_state.get("spacing_factor_y", _save_sfx))
+    state_for_save["spacing_factor"] = max(_save_sfx, _save_sfy)
+    state_for_save["sf_x"] = _save_sfx
+    state_for_save["sf_y"] = _save_sfy
+    sl1.download_button(
+        "💾 Save",
+        data=json.dumps(state_for_save, indent=2),
+        file_name="pile_cap_design.json",
+        mime="application/json",
+        use_container_width=True)
+    up = sl2.file_uploader("📂 Open File", type="json",
+                           label_visibility="visible",
+                           key="json_uploader")
+    if up is not None and up.file_id != st.session_state.get(
+            "_last_upload_id"):
+        try:
+            data = json.loads(up.read().decode("utf-8"))
+            for k in DEFAULTS:
+                if k in data:
+                    st.session_state[k] = data[k]
+            if "spacing_factor" in data:
+                if "spacing_factor_x" not in data:
+                    st.session_state.spacing_factor_x = data["spacing_factor"]
+                if "spacing_factor_y" not in data:
+                    st.session_state.spacing_factor_y = data["spacing_factor"]
+            st.session_state["_last_upload_id"] = up.file_id
+            st.success("Loaded — refreshing...")
+            st.rerun()
+        except Exception as exc:
+            st.error("Load failed: {}".format(exc))
+    st.caption("💡 ไฟล์จะถูกบันทึกที่ Downloads folder "
+               "หากต้องการเลือก folder เอง ให้เปิด "
+               "\"Ask where to save\" ในการตั้งค่า Browser")
+
+    st.divider()
+    st.header("⚙️ Inputs")
+
+    with st.expander("Materials", expanded=True):
+        st.number_input("f'c (MPa)", 21.0, 80.0, step=1.0, key="fc")
+        st.number_input("fy (MPa)", 280.0, 700.0, step=10.0, key="fy")
+        st.number_input("Cover (mm)", 50, 200, step=5, key="cover")
+
+    with st.expander("Column Loads", expanded=True):
+        st.number_input("Pu — axial (kN)",
+                        100.0, 50000.0, step=100.0, key="Pu")
+        st.number_input("Mux — moment about X (kN·m)",
+                        -50000.0, 50000.0, step=10.0, key="Mux",
+                        help="P_i ∝ +y_i when Mux > 0")
+        st.number_input("Muy — moment about Y (kN·m)",
+                        -50000.0, 50000.0, step=10.0, key="Muy",
+                        help="P_i ∝ +x_i when Muy > 0")
+        
+        st.selectbox("Column section",
+                     ["Square", "Rectangular", "Circular"],
+                     key="col_section")
+        if st.session_state.col_section == "Square":
+            st.number_input("Column side b (mm)",
+                            min_value=1.0, step=50.0, key="col_bx")
+            st.session_state.col_by = st.session_state.col_bx
+        elif st.session_state.col_section == "Rectangular":
+            cc1, cc2 = st.columns(2)
+            cc1.number_input("bx (mm)", min_value=1.0,
+                             step=50.0, key="col_bx")
+            cc2.number_input("by (mm)", min_value=1.0,
+                             step=50.0, key="col_by")
+        else:
+            st.number_input("Diameter D_c (mm)",
+                            min_value=1.0, step=50.0, key="col_diam")
+        pc1, pc2 = st.columns(2)
+        pc1.number_input("Column X (mm)",
+                         step=50.0, key="col_x",
+                         help="Column/load point coordinate measured from layout origin.")
+        pc2.number_input("Column Y (mm)",
+                         step=50.0, key="col_y",
+                         help="Column/load point coordinate measured from layout origin.")
+        st.selectbox(
+            "STM model type",
+            ["Point Column STM", "Wall/Abutment STM"],
+            key="stm_model_type",
+            help=("Point Column STM uses the column centroid as the top node "
+                  "for all struts. Wall/Abutment STM distributes the top "
+                  "node along the wall length in X and uses the wall "
+                  "centerline in Y at the pile-cap top face."))
+
+    with st.expander("Pile & Cap", expanded=True):
+        st.selectbox("Pile section",
+                     ["Circular", "Square", "Rectangular"],
+                     key="pile_section")
+        if st.session_state.pile_section == "Circular":
+            st.number_input("Pile diameter D (mm)",
+                            min_value=1.0, step=50.0, key="pile_diam")
+        elif st.session_state.pile_section == "Square":
+            st.number_input("Pile side b (mm)",
+                            min_value=1.0, step=50.0, key="pile_bx")
+            st.session_state.pile_by = st.session_state.pile_bx
+        else:
+            pp1, pp2 = st.columns(2)
+            pp1.number_input("Pile bx (mm)",
+                             min_value=1.0, step=50.0, key="pile_bx")
+            pp2.number_input("Pile by (mm)",
+                             min_value=1.0, step=50.0, key="pile_by")
+        st.number_input("Cap thickness (mm)", min_value=1, step=50,
+                        key="h_cap")
+        st.number_input(
+            "W_cap ULS factor (γ)",
+            min_value=1.0, max_value=2.0, step=0.05,
+            key="wcap_uls_factor",
+            help="W_cap(ULS) = Lx × Ly × h × 24 × γ  "
+                 "ค่าแนะนำ: 1.2 (DL factor) หรือ 1.35 (Eurocode)")
+
+    fc = st.session_state.fc
+    fy = st.session_state.fy
+    cover = st.session_state.cover
+    Pu = st.session_state.Pu
+    Mux = st.session_state.Mux
+    Muy = st.session_state.Muy
+    col_size = {
+        "section": st.session_state.col_section,
+        "bx": float(st.session_state.col_bx),
+        "by": float(st.session_state.col_by),
+        "diam": float(st.session_state.col_diam),
+        "x": float(st.session_state.col_x),
+        "y": float(st.session_state.col_y),
+        "stm_model_type": st.session_state.stm_model_type,
+    }
+    D = {
+        "section": st.session_state.pile_section,
+        "bx": float(st.session_state.pile_bx),
+        "by": float(st.session_state.pile_by),
+        "diam": float(st.session_state.pile_diam),
+    }
+    h_cap = st.session_state.h_cap
+
+    st.divider()
+    st.header("📐 Pile Arrangement")
+
+    if D["section"] == "Circular":
+        _gov_max = D["diam"]
+    elif D["section"] == "Square":
+        _gov_max = D["bx"]
+    else:
+        _gov_max = max(D["bx"], D["by"])
+    e_def = max(150.0, 0.75 * _gov_max)
+    _preset_sfx = float(st.session_state.get(
+        "spacing_factor_x", st.session_state.get("spacing_factor", 2.5)))
+    _preset_sfy = float(st.session_state.get(
+        "spacing_factor_y", st.session_state.get("spacing_factor", 2.5)))
+    presets_init = get_preset_layouts(
+        D, sf=max(_preset_sfx, _preset_sfy),
+        clear_min=st.session_state.clear_min,
+        sf_x=_preset_sfx, sf_y=_preset_sfy,
+        e_left=e_def, e_right=e_def, e_top=e_def, e_bot=e_def)
+    options = list(presets_init.keys()) + [
+        "3-Pile (Truncated Triangle - Equal corners)",
+        "Custom (User-defined coords)",
+    ]
+    if st.session_state.preset_choice not in options:
+        st.session_state.preset_choice = (
+            "4-Pile (Square)" if "4-Pile (Square)" in options else options[0]
+        )
+    st.selectbox("Preset", options, key="preset_choice")
+    chosen = st.session_state.preset_choice
+
+    is_custom = chosen.startswith("Custom")
+    is_trunc = chosen.startswith("3-Pile (Truncated")
+
+    sp1, sp2 = st.columns(2)
+    sp1.number_input("X spacing factor (xD)", min_value=0.0, step=0.1,
+                     key="spacing_factor_x",
+                     disabled=(is_custom or is_trunc),
+                     help="Center-to-center spacing along the X direction.")
+    sp2.number_input("Y spacing factor (xD)", min_value=0.0, step=0.1,
+                     key="spacing_factor_y",
+                     disabled=(is_custom or is_trunc),
+                     help="Center-to-center spacing along the Y direction.")
+    st.session_state.spacing_factor = max(
+        float(st.session_state.spacing_factor_x),
+        float(st.session_state.spacing_factor_y))
+    st.session_state.sf_x = float(st.session_state.spacing_factor_x)
+    st.session_state.sf_y = float(st.session_state.spacing_factor_y)
+
+    with st.expander("⚙️ Spacing limits / anti-overlap", expanded=False):
+        st.number_input(
+            "Min clear edge-to-edge (mm)",
+            min_value=0.0, step=50.0, key="clear_min",
+            disabled=(is_custom or is_trunc),
+            help="Anti-collision: pile edges never closer than this. "
+                 "Default 500 mm.")
+        st.caption(
+            "Auto-fix rule: sx = max(sf_x × pile_X, pile_X + clear_min), "
+            "sy = max(sf_y × pile_Y, pile_Y + clear_min). "
+            "For 300×1000 piles → spacing auto-expands along the long axis "
+            "to prevent overlap.")
+
+    st.markdown("**Edge distance per side (mm)**")
+    c1, c2 = st.columns(2)
+    c1.number_input("e_left", min_value=0.0, step=10.0, key="e_left")
+    c2.number_input("e_right", min_value=0.0, step=10.0, key="e_right")
+    c1.number_input("e_top", min_value=0.0, step=10.0, key="e_top")
+    c2.number_input("e_bot", min_value=0.0, step=10.0, key="e_bot")
+    e_left = st.session_state.e_left
+    e_right = st.session_state.e_right
+    e_top = st.session_state.e_top
+    e_bot = st.session_state.e_bot
+    spacing_factor_x = float(st.session_state.spacing_factor_x)
+    spacing_factor_y = float(st.session_state.spacing_factor_y)
+    spacing_factor_diag = max(spacing_factor_x, spacing_factor_y)
+
+    coords = []
+    shape_label = "Custom"
+    cap_lx = cap_ly = 1500.0
+    cap_cx = cap_cy = 0.0
+    cap_polygon = None
+    trunc_extra = ""
+
+    if is_trunc:
+        st.markdown("**Truncated Equilateral Triangle**")
+        st.number_input("Side L (mm)", min_value=1, step=50, key="L_side")
+        st.number_input("Truncation w (mm)", min_value=0, step=25,
+                        key="w_trunc")
+        st.number_input("Pile-to-edge e (mm)", min_value=0.0, step=10.0,
+                        key="e_trunc")
+        cfg = get_truncated_triangle_equal(
+            D, float(st.session_state.L_side),
+            float(st.session_state.w_trunc),
+            float(st.session_state.e_trunc))
+        coords = list(cfg["coords"])
+        shape_label = cfg["shape"]
+        cap_lx, cap_ly = cfg["lx"], cfg["ly"]
+        cap_cx, cap_cy = cfg["cx"], cfg["cy"]
+        cap_polygon = cfg["cap_polygon"]
+        trunc_extra = (
+            "d_p = R - w·√3/2 - e - D/2 = {:.0f} mm  |  "
+            "Pile spacing = d_p·√3 = {:.0f} mm".format(
+                cfg['d_p'], cfg['pile_spacing']))
+        if cfg['d_p'] <= 0:
+            st.error("Triangle too small. Increase L.")
+    elif not is_custom:
+        presets = get_preset_layouts(
+            D, sf=spacing_factor_diag,
+            clear_min=st.session_state.clear_min,
+            sf_x=spacing_factor_x, sf_y=spacing_factor_y,
+            e_left=e_left, e_right=e_right,
+            e_top=e_top, e_bot=e_bot)
+        cfg = presets[chosen]
+        coords = list(cfg["coords"])
+        shape_label = cfg["shape"]
+        cap_lx, cap_ly = cfg["lx"], cfg["ly"]
+        cap_cx, cap_cy = cfg["cx"], cfg["cy"]
+    else:
+        st.markdown("**Custom coordinates (mm)** (one `x, y` per line)")
+        st.caption(
+            "Default = 4 piles in a 3×3 m square arrangement. "
+            "Edit, then click Update to apply.")
+        _default_custom = "1500,1500\n-1500,1500\n-1500,-1500\n1500,-1500"
+        _applied_txt = st.session_state.get("custom_text", "") or ""
+        if not _applied_txt.strip():
+            _applied_txt = _default_custom
+            st.session_state.custom_text = _applied_txt
+        if st.session_state.get("_custom_text_applied_seen") != _applied_txt:
+            st.session_state.custom_text_draft = _applied_txt
+            st.session_state._custom_text_applied_seen = _applied_txt
+        st.text_area("Coords", height=140,
+                     label_visibility="collapsed",
+                     key="custom_text_draft")
+        draft_txt = st.session_state.get("custom_text_draft", "")
+        draft_coords = parse_custom_coords(draft_txt)
+        b_apply, b_status = st.columns([1, 2])
+        if b_apply.button("Update pile coordinates",
+                          use_container_width=True,
+                          key="apply_custom_coords"):
+            if len(draft_coords) < 2:
+                st.error("Please enter at least 2 valid pile coordinates.")
+            else:
+                st.session_state.custom_text = draft_txt
+                st.session_state._custom_text_applied_seen = draft_txt
+                st.session_state.pop("_stm_results", None)
+                st.rerun()
+        if draft_txt != _applied_txt:
+            b_status.warning(
+                "Draft not applied yet. Click Update to refresh the plot.")
+        else:
+            b_status.caption(
+                "Applied coordinates: {} pile(s).".format(len(draft_coords)))
+        coords = parse_custom_coords(st.session_state.custom_text)
+        st.selectbox("Cap shape (visual)",
+                     ["Square", "Rectangular", "Triangular"],
+                     key="custom_shape")
+        shape_label = st.session_state.custom_shape
+        if coords:
+            cap_lx, cap_ly, cap_cx, cap_cy = compute_cap_bounds_per_side(
+                coords, e_left, e_right, e_top, e_bot, D)
+
+    _col_width_x = (
+        float(col_size["diam"]) if col_size["section"] == "Circular"
+        else float(col_size["bx"]))
+    _long_wall_ratio = _col_width_x / cap_lx if cap_lx else 0.0
+    if (st.session_state.stm_model_type == "Point Column STM" and
+            col_size["section"] == "Rectangular" and
+            _long_wall_ratio >= 0.50):
+        st.warning(
+            "Long wall/abutment behavior detected: column bx is {:.0%} of "
+            "cap Lx. Point Column STM may create artificial shallow struts. "
+            "Consider using Wall/Abutment STM.".format(_long_wall_ratio))
+
+    st.divider()
+    st.subheader("🔩 Rebar Selection")
+    bar_options = list(REBAR_DB.keys())
+    cA, cB = st.columns(2)
+    cA.selectbox("X-dir bar", bar_options, key="x_bar")
+    cA.number_input("X-dir count", 2, 400, step=1, key="x_n")
+    cB.selectbox("Y-dir bar", bar_options, key="y_bar")
+    cB.number_input("Y-dir count", 2, 400, step=1, key="y_n")
+    st.selectbox(
+        "Anchorage mode",
+        ["90° Vertical Hook", "Horizontal to edge"],
+        key="anchorage_mode",
+        help=("90° Vertical Hook checks the hook leg up through the cap "
+              "thickness. Horizontal to edge uses the plan edge distance."))
+    st.number_input(
+        "Bottom bar z from cap bottom (mm)",
+        min_value=0.0, step=10.0, key="anchorage_bottom_z",
+        disabled=(st.session_state.anchorage_mode != "90° Vertical Hook"),
+        help=("Approximate centroid level of bottom tie bars above the cap "
+              "bottom. Include pile-head embedment and detailing clearance."))
+    x_bar = st.session_state.x_bar
+    x_n = st.session_state.x_n
+    y_bar = st.session_state.y_bar
+    y_n = st.session_state.y_n
+
+    st.divider()
+    calc_btn = st.button("🧮 Calculate STM",
+                         type="primary", use_container_width=True)
+
+# ===== Validation =====
+ok_sp, mn_sp, viol, mn_req, pairs = validate_pile_spacing(
+    coords, D, mf=2.5, clear_min=st.session_state.clear_min)
+mn_clear = min((p[3] for p in pairs), default=0.0)
+
+# ===== Layout & Status =====
+left, right = st.columns([3, 2], gap="large")
+with left:
+    st.subheader("📍 Layout Preview (Live)")
+    if not coords:
+        st.warning("No piles defined.")
+    else:
+        W_cap_preview = _cap_area_m2(cap_polygon, cap_lx, cap_ly) \
+                        * (h_cap/1000.0) * 24.0 \
+                        * st.session_state.wcap_uls_factor
+        pile_loads_preview = compute_pile_reactions(
+            coords, Pu + W_cap_preview, Mux, Muy,
+            load_point=(col_size["x"], col_size["y"]))
+        st.plotly_chart(
+            plot_layout_preview(
+                coords, D, cap_lx, cap_ly, cap_cx, cap_cy,
+                col_size, shape_label,
+                cap_polygon=cap_polygon,
+                edge_info=(e_left, e_right, e_top, e_bot),
+                pile_loads=pile_loads_preview),
+            use_container_width=True)
+        if trunc_extra:
+            st.info(trunc_extra)
+
+with right:
+    st.subheader("✅ Layout Status")
+    if not coords:
+        st.error("No piles defined.")
+    else:
+        c1, c2 = st.columns(2)
+        c1.metric("Piles", len(coords))
+        c2.metric("Shape", shape_label)
+        c1.metric("Min spacing", "{:.0f} mm".format(mn_sp))
+        c2.metric("Required (2.5 × D_short)",
+                  "{:.0f} mm".format(mn_req),
+                  help="ACI rule: 2.5 × pile_min_dim "
+                       "(shorter side for Barrette piles)")
+        c1.metric("Min clear", "{:.0f} mm".format(mn_clear))
+        c2.metric("Required clear", "{:.0f} mm".format(st.session_state.clear_min))
+        if ok_sp:
+            st.success(
+                "All pile-pair distances and edge clearances satisfy limits.")
+        else:
+            st.error("{} pile spacing/clearance violation(s).".format(len(viol)))
+            for _i, _j, _d, _clear, _reason in viol[:5]:
+                st.caption("P{}-P{}: {}".format(_i, _j, _reason))
+        st.markdown("**Pile-Pair Distances** (d = √(Δx² + Δy²))")
+        if pairs:
+            pdf = pd.DataFrame([{
+                "Pair": "P{}-P{}".format(i, j),
+                "d (mm)": "{:.0f}".format(d),
+                "Clear (mm)": "{:.0f}".format(clear),
+                "c/c OK?": "✅" if ctc_ok else "❌",
+                "Clear OK?": "✅" if clear_ok else "❌",
+                "OK?": "✅" if ok else "❌",
+            } for (i, j, d, clear, ctc_ok, clear_ok, ok) in pairs])
+            st.dataframe(pdf, use_container_width=True, hide_index=True,
+                         height=min(35*len(pairs)+38, 240))
+
+st.info(
+    "ℹ️ **ACI 318-19 §13.4.6.3 Note:** When the Strut-and-Tie Method (STM) "
+    "is used to design a pile cap in accordance with ACI 318-19 Chapter 23, "
+    "separate **beam-shear** and **two-way (punching)** shear checks are "
+    "**NOT required**. The shear behavior is implicitly captured through "
+    "the strength of struts and nodal zones in the STM model.")
+
+st.divider()
+
+# ===== Calculate =====
+# ===== Calculate =====
+if calc_btn:
+    if not coords:
+        st.error("Cannot calculate: no piles.")
+    elif not ok_sp:
+        st.error("Cannot calculate: spacing or pile-clearance violations.")
+    else:
+        # น้ำหนักตัวเอง Pile Cap (ULS): W = Area × h × γc × γ_ULS
+        # Area = พื้นที่จริงของ cap (Shoelace สำหรับ polygon, Lx×Ly สำหรับสี่เหลี่ยม)
+        _W_cap_nom = _cap_area_m2(cap_polygon, cap_lx, cap_ly) * (h_cap/1000.0) * 24.0
+        W_cap_kN = _W_cap_nom * st.session_state.wcap_uls_factor
+        _fy_x = min(REBAR_FY.get(x_bar, fy), FY_CAP_MPA)
+        _fy_y = min(REBAR_FY.get(y_bar, fy), FY_CAP_MPA)
+        _col_design = dict(col_size)
+        _col_design["_cap_lx_mm"] = cap_lx
+        _col_design["_cap_ly_mm"] = cap_ly
+        _res = stm_design(coords, Pu, Mux, Muy, fc, fy, D,
+                          _col_design, h_cap, cover, W_cap_kN=W_cap_kN,
+                          fy_x=_fy_x, fy_y=_fy_y,
+                          x_bar_size=x_bar, y_bar_size=y_bar,
+                          stm_model_type=st.session_state.stm_model_type)
+        if "error" in _res:
+            st.error(_res["error"])
+            st.session_state.pop("_stm_results", None)
+        else:
+            st.session_state["_stm_results"] = _res
+
+# ===== Display (persists across reruns — dropdown-safe) =====
+if "_stm_results" in st.session_state:
+    results = st.session_state["_stm_results"]
+
+    ok = results["overall_OK"]
+    tag = "\u2705 DESIGN OK" if ok else "\u274c DESIGN FAILS"
+    msg = ("{} - Strut DCR={:.2f}, Bearing DCR={:.2f}, "
+           "Column DCR={:.2f}").format(
+        tag, results["strut_DCR"],
+        results["bearing_DCR"], results["column_DCR"])
+    (st.success if ok else st.error)(msg)
+    if results["has_uplift"]:
+        st.warning("\u26a0\ufe0f Uplift detected (P_min = {:.1f} kN). "
+                   "Provide tension piles or anchorage.".format(
+                       results["P_min_kN"]))
+    if not results.get("reaction_equilibrium_OK", True):
+        st.error(
+            "Pile reaction equilibrium cannot satisfy the applied moments. "
+            "Residuals: Mux={:.1f} kN·m, Muy={:.1f} kN·m.".format(
+                results.get("reaction_equilibrium_residual_Mux_kNm", 0.0),
+                results.get("reaction_equilibrium_residual_Muy_kNm", 0.0)))
+    for _warning in results.get("reaction_warnings", []):
+        st.warning(_warning)
+    if results.get("capacity_model_note"):
+        st.info(results["capacity_model_note"])
+    if (results.get("x_bar_size") and
+            (results.get("x_bar_size") != x_bar or
+             results.get("y_bar_size") != y_bar)):
+        st.warning(
+            "Bottom bar size changed after the last calculation. "
+            "Click Calculate STM again to refresh As demand with the selected fy.")
+    _calc_col = results.get("column_position", (0.0, 0.0))
+    if (abs(_calc_col[0] - col_size["x"]) > 1e-6 or
+            abs(_calc_col[1] - col_size["y"]) > 1e-6):
+        st.warning(
+            "Column position changed after the last calculation. "
+            "Click Calculate STM again to refresh reactions, struts, and ties.")
+    if results.get("stm_model_type") != st.session_state.stm_model_type:
+        st.warning(
+            "STM model type changed after the last calculation. "
+            "Click Calculate STM again to refresh strut geometry and tie demand.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Pu (column)",
+              "{:.0f} kN".format(results["Pu_kN"]))
+    m2.metric("W_cap (self-wt)",
+              "{:.0f} kN".format(results["W_cap_kN"]),
+              help="Lx × Ly × h × 24 kN/m³")
+    m3.metric("Pu_total",
+              "{:.0f} kN".format(results["Pu_total_kN"]),
+              help="Pu + W_cap — used for pile reaction calculation")
+    m4.metric("P_max (pile)",
+              "{:.0f} kN".format(results["P_max_kN"]))
+    col_x_res, col_y_res = results.get("column_position", (0.0, 0.0))
+    st.caption("Column/load point = ({:.0f}, {:.0f}) mm".format(
+        col_x_res, col_y_res))
+    st.caption("STM model = {}. {}".format(
+        results.get("stm_model_type", "Point Column STM"),
+        results.get("stm_model_note", "")))
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Tie X max",
+              "{:.0f} kN".format(results["F_tie_x_max_kN"]))
+    m6.metric("Tie Y max",
+              "{:.0f} kN".format(results["F_tie_y_max_kN"]))
+    m7.metric("d_eff",
+              "{:.0f} mm".format(results["d_effective_mm"]))
+    m8.metric("Min strut angle",
+              "{:.1f}°".format(results["min_strut_angle_deg"]),
+              help="ACI requires ≥ 25°")
+
+    _rho_lbl = "ρ_min={:.4f}·Ag".format(results.get("rho_bottom_min", 0.0018))
+    x_chk = check_rebar(x_bar, int(x_n),
+                        results["As_x_required_mm2"],
+                        fy_mpa=results.get("fy_x_design_mpa", fy),
+                        force_req_kN=results.get("F_tie_x_design_kN"),
+                        rho_label=_rho_lbl)
+    y_chk = check_rebar(y_bar, int(y_n),
+                        results["As_y_required_mm2"],
+                        fy_mpa=results.get("fy_y_design_mpa", fy),
+                        force_req_kN=results.get("F_tie_y_design_kN"),
+                        rho_label=_rho_lbl)
+
+    # Auto-optimize
+    opt_x, opts_x = optimize_rebar(
+        results["As_x_required_mm2"], cap_lx,
+        force_req_kN=results.get("F_tie_x_design_kN"),
+        min_As_req=results.get("As_x_min_required_mm2"))
+    opt_y, opts_y = optimize_rebar(
+        results["As_y_required_mm2"], cap_ly,
+        force_req_kN=results.get("F_tie_y_design_kN"),
+        min_As_req=results.get("As_y_min_required_mm2"))
+
+    # Anchorage check
+    # use D/4 (inner face of CCT node) not D/2
+    avail_str_x = min(e_left, e_right) + _gov_max/4.0 - cover
+    avail_hook_x = avail_str_x - cover
+    avail_str_y = min(e_top, e_bot) + _gov_max/4.0 - cover
+    avail_hook_y = avail_str_y - cover
+    anchorage_mode = st.session_state.get(
+        "anchorage_mode", "90° Vertical Hook")
+    bottom_bar_z = float(st.session_state.get("anchorage_bottom_z", 150.0))
+    avail_vertical_hook = max(0.0, h_cap - bottom_bar_z - cover)
+    use_vertical_hook = (anchorage_mode == "90° Vertical Hook")
+    anch_x = _check_anchorage_with_mode(
+        x_bar, fc, results.get("fy_x_design_mpa", fy),
+        avail_str_x, avail_hook_x,
+        anchorage_mode, avail_vertical_hook)
+    anch_y = _check_anchorage_with_mode(
+        y_bar, fc, results.get("fy_y_design_mpa", fy),
+        avail_str_y, avail_hook_y,
+        anchorage_mode, avail_vertical_hook)
+
+    # Top-face reinforcement — always recomputed fresh (dropdown-safe)
+    top_rebar = compute_top_reinforcement(
+        lx_mm=cap_lx, ly_mm=cap_ly,
+        h_cap_mm=h_cap, fy_mpa=fy, fc_mpa=fc,
+        cover_mm=cover,
+        top_bar_size=st.session_state.get("top_bar_size", "DB20"))
+    top_rebar = _ensure_top_rebar_schedule(
+        top_rebar, cap_lx, cap_ly, cover)
+
+    recs = _design_recommendations(
+        results, x_chk=x_chk, y_chk=y_chk,
+        anch_x=anch_x, anch_y=anch_y,
+        opt_x=opt_x, opt_y=opt_y, cover=cover)
+    if recs and (not results["overall_OK"] or not x_chk["ok"] or
+                 not y_chk["ok"] or not anch_x["ok"] or not anch_y["ok"]):
+        st.warning("แนวทางปรับแบบให้ผ่านเกณฑ์")
+        st.dataframe(pd.DataFrame(recs), use_container_width=True,
+                     hide_index=True)
+
+    t1, t2, t6, t3, t7, t4, t5, t8 = st.tabs([
+        "📊 Plan", "📈 Elevation", "🎲 3D View",
+        "🔩 Bottom Rebar", "🪟 Top Rebar",
+        "⚓ Anchorage", "📋 Detail", "🧱 Pile Head Forces"])
+
+    with t1:
+        st.plotly_chart(
+            plot_plan_view(coords, D, cap_lx, cap_ly,
+                           col_size, results,
+                           cap_cx, cap_cy, cap_polygon),
+            use_container_width=True)
+        st.markdown("**Pile Reactions** (rigid-cap formula)")
+        _formula_box(
+            "P_i = Pu_total/n + Mux,c*y'_i / sum(y'_j^2) "
+            "+ Muy,c*x'_i / sum(x'_j^2)")
+        rdf = pd.DataFrame([{
+            "Pile": "P{}".format(i+1),
+            "X (mm)": "{:.0f}".format(c[0]),
+            "Y (mm)": "{:.0f}".format(c[1]),
+            "x' (mm)": "{:.0f}".format(
+                results.get("reaction_coords", [(0, 0)]*len(coords))[i][0]),
+            "y' (mm)": "{:.0f}".format(
+                results.get("reaction_coords", [(0, 0)]*len(coords))[i][1]),
+            "P_i (kN)": "{:.1f}".format(P),
+        } for i, (c, P) in enumerate(
+            zip(coords, results["pile_loads_kN"]))])
+        st.dataframe(rdf, use_container_width=True, hide_index=True)
+
+    with t2:
+        st.plotly_chart(
+            plot_elevation(coords, h_cap, D, col_size, results),
+            use_container_width=True)
+    
+    with t6:
+        st.plotly_chart(
+            plot_3d_view(coords, D, cap_lx, cap_ly,
+                         cap_cx, cap_cy, col_size, h_cap,
+                         cap_polygon, results,
+                         show_force_labels=False,
+                         show_member_labels=True),
+            use_container_width=True)
+        st.caption(
+            "🖱️ **Drag** to rotate | **Scroll** to zoom | "
+            "**Shift+drag** to pan | **Double-click** to reset view | "
+            "Hover on struts/ties to inspect force values.")
+        st.markdown(
+            "**Color legend (Struts):** "
+            "🟢 DCR < 60% | 🟠 60–85% | 🔴 > 85%  &nbsp;&nbsp; "
+            "**Member labels:** `S#` = strut, `T#` = tie path, `P#` = pile. "
+            "Numerical design forces are listed in the tables below.")
+        force_summary_rows = _design_force_summary_rows(results)
+        if force_summary_rows:
+            st.markdown("### Design Force Summary")
+            st.dataframe(
+                pd.DataFrame(force_summary_rows),
+                use_container_width=True, hide_index=True)
+            st.caption(
+                "Strut force is the maximum compression demand used for the "
+                "strut DCR check. Tie force is the STM demand used for bottom "
+                "reinforcement before comparing with minimum reinforcement.")
+        strut_force_rows = _strut_force_rows(results)
+        if strut_force_rows:
+            st.markdown("### Strut Forces by Member")
+            st.dataframe(
+                pd.DataFrame(strut_force_rows),
+                use_container_width=True, hide_index=True)
+        tie_member_rows = _tie_member_rows(coords, results)
+        if tie_member_rows:
+            st.markdown("### Tie Forces by Member")
+            st.dataframe(
+                pd.DataFrame(tie_member_rows),
+                use_container_width=True, hide_index=True)
+            st.caption(
+                "Tie member forces are estimated for the displayed T# paths "
+                "from cut equilibrium of local strut components. Use the "
+                "Design Force Summary for governing bottom reinforcement.")
+    
+    with t3:
+        st.markdown("### Required Reinforcement")
+        st.caption(
+            "Bottom-face steel is checked per direction against both STM tie "
+            "demand and minimum flexural reinforcement: "
+            "As_req = max(As_STM, ρ_min·Ag)  "
+            "โดย ρ_min = max(0.0018×420/fy, 0.0014)  [ACI §9.6.1.2]")
+        if results.get("is_3pile_resultant"):
+            tie_x_display = tie_y_display = results["F_tie_res_kN"]
+            note = " (Resultant)"
+        else:
+            tie_x_display = results["F_tie_x_max_kN"]
+            tie_y_display = results["F_tie_y_max_kN"]
+            note = ""
+        x_spacing = _rebar_spacing_text(
+            x_n, cap_ly, cap_lx, cap_ly, cover)
+        y_spacing = _rebar_spacing_text(
+            y_n, cap_lx, cap_lx, cap_ly, cover)
+        req_df = pd.DataFrame([
+            {"Direction": "X"+note,
+             "Tie (kN)":
+                 "{:.1f}".format(tie_x_display),
+             "As STM (mm²)":
+                 "{:.0f}".format(results.get("As_x_stm_required_mm2", 0.0)),
+             "As min ρ_min·Ag (mm²)":
+                 "{:.0f}".format(results.get("As_x_min_required_mm2", 0.0)),
+             "As req = max (mm²)":
+                 "{:.0f}".format(results["As_x_required_mm2"]),
+             "Governs":
+                 results.get("As_x_governs", "—"),
+             "fy used (MPa)":
+                 "{:.0f}".format(results.get("fy_x_design_mpa", fy)),
+             "Selected": "{}-{}".format(int(x_n), x_bar),
+             "Spacing s (mm)":
+                 x_spacing,
+             "As prov (mm²)":
+                 "{:.0f}".format(x_chk["As_provided"]),
+             "Min OK":
+                 "✅" if x_chk["As_provided"] >= results.get("As_x_min_required_mm2", 0.0) else "❌",
+             "STM OK":
+                 "✅" if x_chk.get("force_ok", True) else "❌",
+             "Ratio": "{:.2f}".format(x_chk["ratio"]),
+             "Status": "✅ OK" if x_chk["ok"] else "❌ FAIL"},
+            {"Direction": "Y"+note,
+             "Tie (kN)":
+                 "{:.1f}".format(tie_y_display),
+             "As STM (mm²)":
+                 "{:.0f}".format(results.get("As_y_stm_required_mm2", 0.0)),
+             "As min ρ_min·Ag (mm²)":
+                 "{:.0f}".format(results.get("As_y_min_required_mm2", 0.0)),
+             "As req = max (mm²)":
+                 "{:.0f}".format(results["As_y_required_mm2"]),
+             "Governs":
+                 results.get("As_y_governs", "—"),
+             "fy used (MPa)":
+                 "{:.0f}".format(results.get("fy_y_design_mpa", fy)),
+             "Selected": "{}-{}".format(int(y_n), y_bar),
+             "Spacing s (mm)":
+                 y_spacing,
+             "As prov (mm²)":
+                 "{:.0f}".format(y_chk["As_provided"]),
+             "Min OK":
+                 "✅" if y_chk["As_provided"] >= results.get("As_y_min_required_mm2", 0.0) else "❌",
+             "STM OK":
+                 "✅" if y_chk.get("force_ok", True) else "❌",
+             "Ratio": "{:.2f}".format(y_chk["ratio"]),
+             "Status": "✅ OK" if y_chk["ok"] else "❌ FAIL"},
+        ])
+        st.dataframe(req_df, use_container_width=True,
+                     hide_index=True)
+
+        # ── ρ_min note ──────────────────────────────────────────────
+        _rho_min_val = results.get("rho_bottom_min", 0.0018)
+        _fy_min_val  = min(results.get("fy_x_design_mpa", fy),
+                           results.get("fy_y_design_mpa", fy))
+        st.caption(
+            "📐 **เหล็กล่าง:** ρ_min = max(0.0018 × 420 / fy, 0.0014) "
+            "= max(0.0018 × 420 / {:.0f}, 0.0014) = **{:.5f}** "
+            " [ACI 318-19 §9.6.1.2]  "
+            "→  As_min = ρ_min × Ag = {:.5f} × Ag".format(
+                _fy_min_val, _rho_min_val, _rho_min_val))
+
+        if results.get("is_3pile_resultant"):
+            st.info("ฐาน 3 เข็ม: แรงออกแบบใช้ F_res = √(Ftx²+Fty²) = {:.1f} kN; As แต่ละทิศคำนวณด้วย fy ของเหล็กที่เลือกในทิศนั้น".format(results["F_tie_res_kN"]))
+
+        st.markdown("### 🤖 Auto-Optimized Rebar (Min Weight)")
+        col_o1, col_o2, col_o3 = st.columns([2, 2, 1])
+        col_o1.success(
+            "**X-dir optimal:** {}-{} | "
+            "As={:.0f} mm² | Wt={:.2f} kg".format(
+                opt_x["n_bars"], opt_x["bar_size"],
+                opt_x["As_provided"], opt_x["weight_kg"]))
+        col_o2.success(
+            "**Y-dir optimal:** {}-{} | "
+            "As={:.0f} mm² | Wt={:.2f} kg".format(
+                opt_y["n_bars"], opt_y["bar_size"],
+                opt_y["As_provided"], opt_y["weight_kg"]))
+        if col_o3.button("Back To Rebar Selection", use_container_width=True):
+            st.session_state.x_bar = opt_x["bar_size"]
+            st.session_state.x_n = int(opt_x["n_bars"])
+            st.session_state.y_bar = opt_y["bar_size"]
+            st.session_state.y_n = int(opt_y["n_bars"])
+            st.rerun()
+
+        with st.expander("All optimization candidates"):
+            cox, coy = st.columns(2)
+            cox.markdown("**X-direction**")
+            cox.dataframe(pd.DataFrame([{
+                "Bar": o["bar_size"], "n": o["n_bars"],
+                "As req (mm²)": "{:.0f}".format(o["As_required"]),
+                "As (mm²)": "{:.0f}".format(o["As_provided"]),
+                "Governs": o.get("governs", "—"),
+                "Wt (kg)": "{:.2f}".format(o["weight_kg"]),
+                "OK": "✅" if o["ok"] else "❌",
+            } for o in opts_x]), hide_index=True,
+                use_container_width=True)
+            coy.markdown("**Y-direction**")
+            coy.dataframe(pd.DataFrame([{
+                "Bar": o["bar_size"], "n": o["n_bars"],
+                "As req (mm²)": "{:.0f}".format(o["As_required"]),
+                "As (mm²)": "{:.0f}".format(o["As_provided"]),
+                "Governs": o.get("governs", "—"),
+                "Wt (kg)": "{:.2f}".format(o["weight_kg"]),
+                "OK": "✅" if o["ok"] else "❌",
+            } for o in opts_y]), hide_index=True,
+                use_container_width=True)
+
+        st.markdown("### Reinforcement Layout (Plan)")
+        st.plotly_chart(
+            plot_rebar_layout(coords, D, cap_lx, cap_ly,
+                cap_cx, cap_cy, col_size, cap_polygon, results,
+                x_bar, int(x_n), y_bar, int(y_n), x_chk, y_chk),
+            use_container_width=True)
+
+    with t4:
+        st.markdown("### Anchorage / Development Length")
+        st.markdown(
+            "Per **ACI 318-19 §23.8.3** tie reinforcement must "
+            "develop fy at the point where the centroid of the tie "
+            "crosses the extended nodal zone (CCT node above pile).")
+        st.caption(
+            "Anchorage mode: {} | Bottom bar z = {:.0f} mm | "
+            "Vertical hook available = {:.0f} mm".format(
+                anchorage_mode, bottom_bar_z, avail_vertical_hook))
+        _formula_box(
+            "ld  ≈ (fy·ψs / 1.1·λ·√f'c · (cb+Ktr)/db) · db   "
+            "(ACI 25.4.2.3)\n"
+            "ldh ≈ (0.24·fy·db) / (λ·√f'c)                  "
+            "(ACI 25.4.3.1a, SI)")
+
+        anch_df = pd.DataFrame([
+            {"Direction": "X", "Bar": anch_x["bar_size"],
+             "ld req (mm)":
+                 "{:.0f}".format(anch_x["ld_required_mm"]),
+             "ldh req (mm)":
+                 "{:.0f}".format(anch_x["ldh_required_mm"]),
+             "Avail. straight":
+                 "{:.0f}".format(anch_x["available_straight_mm"]),
+             "Avail. hook":
+                 "{:.0f}".format(anch_x["available_hook_mm"]),
+             "Mode": anch_x.get("anchorage_mode", "—"),
+             "Recommended": anch_x["recommended"],
+             "Status": "✅" if anch_x["ok"] else "❌"},
+            {"Direction": "Y", "Bar": anch_y["bar_size"],
+             "ld req (mm)":
+                 "{:.0f}".format(anch_y["ld_required_mm"]),
+             "ldh req (mm)":
+                 "{:.0f}".format(anch_y["ldh_required_mm"]),
+             "Avail. straight":
+                 "{:.0f}".format(anch_y["available_straight_mm"]),
+             "Avail. hook":
+                 "{:.0f}".format(anch_y["available_hook_mm"]),
+             "Mode": anch_y.get("anchorage_mode", "—"),
+             "Recommended": anch_y["recommended"],
+             "Status": "✅" if anch_y["ok"] else "❌"},
+        ])
+        st.dataframe(anch_df, use_container_width=True,
+                     hide_index=True)
+
+        if not (anch_x["ok"] and anch_y["ok"]):
+            if use_vertical_hook:
+                st.warning(
+                    "⚠️ Vertical hook anchorage insufficient. Consider: "
+                    "(a) increasing cap thickness, "
+                    "(b) reducing bottom bar z if detailing permits, "
+                    "(c) using smaller bar diameter, or "
+                    "(d) headed/mechanical anchorage.")
+            else:
+                st.warning(
+                    "⚠️ Anchorage insufficient. Consider: "
+                    "(a) larger cap dimensions, "
+                    "(b) using 90°/180° standard hooks, "
+                    "(c) headed bars (ACI 25.4.4), "
+                    "or (d) smaller bar diameter.")
+
+        with st.expander("Assumptions used"):
+            st.markdown(
+                "- λ = 1.0 (normal-weight concrete)\n"
+                "- ψt=1.0 (bottom bars), ψe=1.0 (uncoated), "
+                "ψg=1.0 (Gr 420), ψr=ψo=ψc=1.0\n"
+                "- (cb+Ktr)/db = 1.5 (conservative typical value)\n"
+                "- Available straight = min edge dist + D/4 − cover  # PATCHED: inner face of CCT node\n"
+                "- Horizontal edge hook = available straight − cover\n"
+                "- 90° vertical hook = h_cap − bottom bar z − top cover")
+
+    with t7:
+        st.markdown("## 🪟 Top-Face Minimum Reinforcement")
+        st.markdown(
+            "เหล็กผิวบนของ pile cap ไม่ได้รับแรงดึงจาก STM โดยตรง "
+            "และ pile cap ที่หนามากมักไม่เกิด top-face tension จากน้ำหนักแนวดิ่ง "
+            "ดังนั้นจึงไม่ควรใช้ ρ_min เต็มค่า (จะได้เหล็กมากเกินจำเป็น) "
+            "→ ใช้ **ρ_top = ρ_min / 2** ในแต่ละทิศทาง  "
+            "โดย ρ_min = max(0.0018 × 420/fy, 0.0014) [ACI §9.6.1.2]")
+
+        # ── Bar selector ─────────────────────────────────────
+        st.markdown("### เลือกขนาดเหล็กผิวบน")
+        _bar_options = list(REBAR_DB.keys())  # DB12…DB32
+        _cur_bar = st.session_state.get("top_bar_size", "DB20")
+        _sel_col, _info_col = st.columns([2, 3])
+        with _sel_col:
+            _chosen_bar = st.selectbox(
+                "Top bar size",
+                options=_bar_options,
+                index=_bar_options.index(_cur_bar),
+                key="top_bar_size",
+                help="เหล็ก ≤ DB28 → fy = 390 MPa | DB32 → fy = 490 MPa")
+        with _info_col:
+            _fy_chosen = REBAR_FY[_chosen_bar]
+            _fy_capped = min(_fy_chosen, FY_CAP_MPA)
+            if _fy_chosen > 420:
+                st.warning(
+                    "**{} : fy = {:.0f} MPa > 420 MPa**  \n"
+                    "ACI §20.2.2.4 → cap ที่ {:.0f} MPa  \n"
+                    "ACI §24.3.2   → spacing limit เพิ่มเติม".format(
+                        _chosen_bar, _fy_chosen, FY_CAP_MPA))
+            else:
+                _fy_d_preview = min(_fy_chosen, FY_CAP_MPA)
+                _rho_min_preview = max(0.0018 * 420.0 / _fy_d_preview, 0.0014)
+                _rho_top_preview = _rho_min_preview / 2.0
+                st.info(
+                    "**{} : fy = {:.0f} MPa ≤ 420 MPa**  \n"
+                    "ρ_min = max(0.0018×420/{:.0f}, 0.0014) = {:.5f}  \n"
+                    "ρ_top = ρ_min / 2 = {:.5f}  |  ไม่มี spacing penalty".format(
+                        _chosen_bar, _fy_chosen,
+                        _fy_d_preview, _rho_min_preview, _rho_top_preview))
+
+        # ── Recompute with selected bar ───────────────────────
+        tr = compute_top_reinforcement(
+            lx_mm=cap_lx, ly_mm=cap_ly,
+            h_cap_mm=h_cap, fy_mpa=fy, fc_mpa=fc,
+            cover_mm=cover, top_bar_size=_chosen_bar)
+        tr = _ensure_top_rebar_schedule(tr, cap_lx, cap_ly, cover)
+        top_rebar = tr
+
+        # ── Code Reference Expander ──────────────────────────
+        with st.expander("📖 Code Basis (ACI 318-19) — คลิกเพื่อดูรายละเอียด"):
+            st.markdown("""
+**Check A — Minimum Reinforcement  §9.6.1.2**
+
+Ag_x = ly × h_cap  |  Ag_y = lx × h_cap
+
+ρ_min = max(0.0018 × 420 / fy, 0.0014)   [ACI §9.6.1.2, fy-dependent]
+
+As_min,bottom = ρ_min × Ag
+
+**Top-face (pile cap หนา — ไม่เกิด top tension):**
+
+ρ_top = ρ_min / 2   →   As_top = ρ_top × Ag
+
+**Spacing Limits**
+
+§24.4.3.3 : s ≤ min(3h, 450 mm)
+§24.3.2   : s ≤ min(380×(280/fs), 300×(280/fs))  where fs = (2/3)fy_d
+    (only becomes active when fy_d > 420 MPa)
+§20.2.2.4 : fy_d used in design capped at 550 MPa
+
+            """)
+
+        # ── Numeric Results ──────────────────────────────────
+        st.markdown("### ผลการคำนวณ  (fy_d = {:.0f} MPa — {})".format(
+            tr["fy_design_mpa"], tr["fy_note"]))
+
+        _top_bar = tr.get("top_bar_size", _chosen_bar)
+        _top_x_detail = "{}-{} @ {:.0f} mm (As={:.0f})".format(
+            int(tr.get("top_x_n_bars", 2)), _top_bar,
+            tr.get("top_x_spacing_mm", 0.0),
+            tr.get("top_x_As_provided_mm2", 0.0))
+        _top_y_detail = "{}-{} @ {:.0f} mm (As={:.0f})".format(
+            int(tr.get("top_y_n_bars", 2)), _top_bar,
+            tr.get("top_y_spacing_mm", 0.0),
+            tr.get("top_y_As_provided_mm2", 0.0))
+
+        res_df = pd.DataFrame([
+            {"Check": "Ag gross strip",
+             "ρ used": "—",
+             "As_X req (mm²)": "{:.0f}".format(tr["Ag_x_mm2"]),
+             "As_Y req (mm²)": "{:.0f}".format(tr["Ag_y_mm2"]),
+             "ใช้เป็น As_top": "ฐานคำนวณ"},
+            {"Check": "ρ_min × Ag  (full bottom min)",
+             "ρ used": "{:.5f}".format(tr["rho_full_min"]),
+             "As_X req (mm²)": "{:.0f}".format(tr["As_full_min_x_mm2"]),
+             "As_Y req (mm²)": "{:.0f}".format(tr["As_full_min_y_mm2"]),
+             "ใช้เป็น As_top": "หาร 2"},
+            {"Check": "ρ_top = ρ_min/2  (top face)",
+             "ρ used": "{:.5f}".format(tr["rho_top"]),
+             "As_X req (mm²)": "{:.0f}".format(tr["As_top_x_mm2"]),
+             "As_Y req (mm²)": "{:.0f}".format(tr["As_top_y_mm2"]),
+             "ใช้เป็น As_top": "✅ Yes"},
+            {"Check": "Recommended top bars",
+             "ρ used": "—",
+             "As_X req (mm²)": _top_x_detail,
+             "As_Y req (mm²)": _top_y_detail,
+             "ใช้เป็น As_top": "Detailing"},
+        ])
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+        # ── ρ_min note ───────────────────────────────────────────────
+        _fy_top_d = tr.get("fy_design_mpa", 390.0)
+        st.caption(
+            "📐 **เหล็กบน:** ρ_min = max(0.0018 × 420 / fy, 0.0014) "
+            "= max(0.0018 × 420 / {:.0f}, 0.0014) = **{:.5f}**"
+            "  →  ρ_top = ρ_min / 2 = **{:.5f}**"
+            "  [ACI 318-19 §9.6.1.2]  "
+            "*(pile cap หนา ไม่เกิด top tension → ใช้ครึ่งค่า)*".format(
+                _fy_top_d,
+                tr["rho_full_min"],
+                tr["rho_top"]))
+
+        c1, c2 = st.columns(2)
+        c1.success(
+            "**X-dir  As_top = {:.0f} mm²**  \n"
+            "Governs: {}".format(
+                tr["As_top_x_mm2"], tr["governs_x"]))
+        c2.success(
+            "**Y-dir  As_top = {:.0f} mm²**  \n"
+            "Governs: {}".format(
+                tr["As_top_y_mm2"], tr["governs_y"]))
+        st.caption(tr["top_design_note"])
+
+        # ── Spacing Check ────────────────────────────────────
+        st.markdown("### ตรวจสอบระยะห่างสูงสุด")
+        _s_ts   = tr["s_ts_max_mm"]
+        _s_cr   = tr["s_crack_mm"]
+        _s_gov  = tr["s_max_top_mm"]
+        _fs     = tr["fs_service_mpa"]
+        spac_df = pd.DataFrame([
+            {"เกณฑ์": "§24.4.3.3  min(3h, 450)",
+             "s_max (mm)": "{:.0f}".format(_s_ts),
+             "Active": "✅ เสมอ"},
+            {"เกณฑ์": "§24.3.2  crack-width  (fs={:.0f} MPa)".format(_fs),
+             "s_max (mm)": "{:.0f}".format(_s_cr),
+             "Active": "⚠️ fy > 420" if tr["fy_design_mpa"] > 420
+                       else "— (fy ≤ 420)"},
+        ])
+        st.dataframe(spac_df, use_container_width=True, hide_index=True)
+        if tr["fy_design_mpa"] > 420:
+            st.warning(
+                "**s_max governing = {:.0f} mm** "
+                "(§24.3.2 controls เนื่องจาก fy = {:.0f} MPa)".format(
+                    _s_gov, tr["fy_design_mpa"]))
+        else:
+            st.info(
+                "**s_max governing = {:.0f} mm** "
+                "(§24.4.3.3 controls)".format(_s_gov))
+
+        # ── Bar Suggestions ──────────────────────────────────
+        st.markdown("### แนะนำขนาดเหล็กผิวบน  (Bar = {})".format(
+            _chosen_bar))
+        _top_bars = ("DB12", "DB16", "DB20", "DB25", "DB28", "DB32")
+        _top_sx = suggest_rebar(tr["As_top_x_mm2"],
+                                preferred=_top_bars)
+        _top_sy = suggest_rebar(tr["As_top_y_mm2"],
+                                preferred=_top_bars)
+
+        def _spac_check(n, width, s_max):
+            """Estimate actual spacing and flag if over limit."""
+            if n <= 1:
+                return "—"
+            s_act = (width - 2*cover) / (n - 1)
+            ok = s_act <= s_max
+            return "{:.0f} mm {}".format(s_act, "✅" if ok else "❌ > {:.0f}".format(s_max))
+
+        sug_df = pd.DataFrame([
+            {"ทิศทาง": "X", "ขนาด": sz,
+             "fy (MPa)": "{:.0f}".format(REBAR_FY.get(sz, fy)),
+             "จำนวน (เส้น)": n,
+             "As prov (mm²)": "{:.0f}".format(a),
+             "As req (mm²)": "{:.0f}".format(tr["As_top_x_mm2"]),
+             "Ratio": "{:.2f}".format(
+                 a / tr["As_top_x_mm2"] if tr["As_top_x_mm2"] else 0),
+             "Spacing (est.)": _spac_check(n, cap_ly, _s_gov),
+             "Status": "✅" if a >= tr["As_top_x_mm2"] else "❌"}
+            for sz, n, a in _top_sx
+        ] + [
+            {"ทิศทาง": "Y", "ขนาด": sz,
+             "fy (MPa)": "{:.0f}".format(REBAR_FY.get(sz, fy)),
+             "จำนวน (เส้น)": n,
+             "As prov (mm²)": "{:.0f}".format(a),
+             "As req (mm²)": "{:.0f}".format(tr["As_top_y_mm2"]),
+             "Ratio": "{:.2f}".format(
+                 a / tr["As_top_y_mm2"] if tr["As_top_y_mm2"] else 0),
+             "Spacing (est.)": _spac_check(n, cap_lx, _s_gov),
+             "Status": "✅" if a >= tr["As_top_y_mm2"] else "❌"}
+            for sz, n, a in _top_sy
+        ])
+        st.dataframe(sug_df, use_container_width=True,
+                     hide_index=True)
+
+        # ── Plan View Diagram ────────────────────────────────
+        st.markdown("### แผนผังเหล็กผิวบน (Plan View)")
+        st.plotly_chart(
+            plot_top_rebar_layout(
+                coords, D, cap_lx, cap_ly,
+                cap_cx, cap_cy, col_size, cap_polygon,
+                tr, cover_mm=cover),
+            use_container_width=True)
+
+        # ── Placement Guide ──────────────────────────────────
+        st.markdown("### ตำแหน่งและรูปแบบการวาง")
+        st.markdown("""
+| ตำแหน่ง | รายละเอียด | อ้างอิง ACI |
+|---|---|---|
+| **ผิวบน แนว X** | วางแนวนอน กระจายตลอดความกว้าง ly | §24.4.3.2 |
+| **ผิวบน แนว Y** | วางแนวขวาง กระจายตลอดความกว้าง lx | §24.4.3.2 |
+| **ระยะ cover ผิวบน** | ≥ 50 mm (exposed) ตามสภาพแวดล้อม | §20.6.1.3 |
+| **ระยะห่างเหล็ก** | ≤ s_max governing (ดูตาราง spacing ด้านบน) | §24.4.3.3, §24.3.2 |
+| **ต่อทับ** | ≥ 1.3 × ld (Class B splice) | §25.5.2 |
+| **fy ใช้ออกแบบ** | ≤DB28 → 390 MPa, DB32 → 490 MPa, cap 550 MPa | §20.2.2.4 |
+""")
+        st.info(
+            "💡 **หมายเหตุ:** เหล็กล่างยังต้องตรวจเต็มค่า ρ_min·Ag แยกจาก STM tie demand "
+            "โดย ρ_min = max(0.0018×420/fy, 0.0014) [ACI §9.6.1.2] "
+            "ส่วนเหล็กบนในหน้านี้ใช้ครึ่งหนึ่งของ minimum gross-area ตามที่กำหนด")
+
+    with t5:
+        st.markdown("### Strut Forces")
+        rows = []
+        for i, s in enumerate(results["struts"]):
+            node_x, node_y = s.get("column_coord", (0.0, 0.0))
+            rows.append({
+                "Strut": "S{}".format(i+1),
+                "X (mm)": round(s["coord"][0],1), "Y (mm)": round(s["coord"][1],1),
+                "Node X (mm)": round(node_x, 1),
+                "Node Y (mm)": round(node_y, 1),
+                "dx_col (mm)": round(s.get("dx_from_col", s["coord"][0]), 1),
+                "dy_col (mm)": round(s.get("dy_from_col", s["coord"][1]), 1),
+                "P_i (kN)": round(s["P_i_kN"], 1),
+                "L (mm)": round(s["L_strut"], 0),
+                "θ (°)": round(s["theta_deg"], 1),
+                "F_strut (kN)": round(s["F_strut_kN"], 1),
+            })
+        st.dataframe(pd.DataFrame(rows),
+                     use_container_width=True, hide_index=True)
+
+        st.markdown("### Tie Design Forces (for reinforcement)")
+        tie_rows = [
+            {"Direction": "X",
+             "Tie force (kN)": "{:.1f}".format(results["F_tie_x_max_kN"]),
+             "Formula": "Σ Pi·|dx_col|/d (controlling side)"},
+            {"Direction": "Y",
+             "Tie force (kN)": "{:.1f}".format(results["F_tie_y_max_kN"]),
+             "Formula": "Σ Pi·|dy_col|/d (controlling side)"},
+        ]
+        if results.get("is_3pile_resultant"):
+            tie_rows.append({
+                "Direction": "Resultant (3-pile)",
+                "Tie force (kN)": "{:.1f}".format(results["F_tie_res_kN"]),
+                "Formula": "√(Ftx²+Fty²) — used for As_x = As_y"
+            })
+        tie_df = pd.DataFrame(tie_rows)
+        st.dataframe(tie_df, use_container_width=True, hide_index=True)
+        if results.get("is_3pile_resultant"):
+            st.info("ฐาน 3 เข็ม: ใช้แรงลัพธ์ F_res เพื่อลดผลของการหมุนพิกัด แล้วคำนวณ As แยกตาม fy ของเหล็กแต่ละทิศ")
+        st.caption("หมายเหตุ: ตาราง Strut แสดงแรงอัดในแต่ละ strut เท่านั้น ส่วนแรงดึงที่ใช้ออกแบบเหล็กคือค่า Tie ด้านบน")
+
+        st.markdown("### Capacity Checks")
+        _bn = results.get("bn_pile", 0.60)
+        _node_lbl = "CTT βn={:.2f}".format(_bn) if results["n_piles"] >= 4 else "CCT βn={:.2f}".format(_bn)
+        ck = pd.DataFrame([
+            {"Check": "Strut compression",
+             "Capacity (kN)":
+                 "{:.0f}".format(results["phi_Fns_kN"]),
+             "Demand (kN)":
+                 "{:.0f}".format(results["F_strut_max_kN"]),
+             "DCR": "{:.2f}".format(results["strut_DCR"]),
+             "Status": "✅" if results["strut_DCR"] <= 1
+                       else "❌"},
+            {"Check": "Pile bearing ({})".format(_node_lbl),
+             "Capacity (kN)":
+                 "{:.0f}".format(results["phi_Pn_bearing_kN"]),
+             "Demand (kN)":
+                 "{:.0f}".format(results["P_max_kN"]),
+             "DCR": "{:.2f}".format(results["bearing_DCR"]),
+             "Status": "✅" if results["bearing_DCR"] <= 1
+                       else "❌"},
+            {"Check": "Column bearing (CCC)",
+             "Capacity (kN)":
+                 "{:.0f}".format(results["phi_Pn_column_kN"]),
+             "Demand (kN)":
+                 "{:.0f}".format(results["Pu_kN"]),
+             "DCR": "{:.2f}".format(results["column_DCR"]),
+             "Status": "✅" if results["column_DCR"] <= 1
+                       else "❌"},
+            {"Check": "Strut angle ≥25° ({:.1f}°)".format(
+                results["min_strut_angle_deg"]),
+             "Capacity (kN)": "-", "Demand (kN)": "-", "DCR": "-",
+             "Status": "✅" if results["angle_OK"] else "❌"},
+        ])
+        extra_checks = [
+            {"Check": "Uplift / tension pile",
+             "Capacity (kN)": "-", "Demand (kN)": "{:.0f}".format(results["P_min_kN"]),
+             "DCR": "-", "Status": "✅" if not results["has_uplift"] else "❌"},
+            {"Check": "Reaction equilibrium",
+             "Capacity (kN)": "-", "Demand (kN)": "-", "DCR": "-",
+             "Status": "✅" if results.get("reaction_equilibrium_OK", True) else "❌"},
+        ]
+        ck = pd.concat([ck, pd.DataFrame(extra_checks)], ignore_index=True)
+        st.dataframe(ck, use_container_width=True, hide_index=True)
+
+    with t8:
+        st.markdown("### Pile Head Forces Below Pile Cap")
+        st.caption(
+            "Forces are derived from the selected STM strut geometry. "
+            "Axial P_i is the rigid-cap pile reaction; H_x and H_y are the "
+            "signed horizontal components of each pile strut at the pile head.")
+        _formula_box(
+            "H_x,i = P_i(compression) x dx_i / d_eff\n"
+            "H_y,i = P_i(compression) x dy_i / d_eff\n"
+            "H_res,i = sqrt(H_x,i^2 + H_y,i^2)\n"
+            "F_strut,i = P_i(compression) x L_strut,i / d_eff\n\n"
+            "Sign convention: +H_x / +H_y follows the direction from the "
+            "selected top compression node toward the pile head.")
+
+        pile_force_rows, pile_force_summary = _pile_head_force_rows(results)
+        if pile_force_summary:
+            st.markdown("### Critical Pile Summary")
+            st.dataframe(
+                pd.DataFrame(pile_force_summary),
+                use_container_width=True, hide_index=True)
+
+        if pile_force_rows:
+            st.markdown("### Forces by Pile")
+            st.dataframe(
+                pd.DataFrame(pile_force_rows),
+                use_container_width=True, hide_index=True)
+            st.info(
+                "Use `Axial P_i` together with `H resultant` or directional "
+                "`H_x/H_y` for preliminary pile-head reinforcement design. "
+                "Pile-head moment is not calculated here because it depends "
+                "on pile fixity, embedment, connection detailing, and soil/"
+                "substructure stiffness assumptions.")
+
+    # Export Report
+    st.divider()
+    st.subheader("📄 Export Report")
+    inputs_dict = {
+        "fc": fc, "fy": fy, "cover": cover,
+        "Pu": Pu, "Mux": Mux, "Muy": Muy,
+        "W_cap_kN": results["W_cap_kN"],
+        "W_cap_nom_kN": _cap_area_m2(cap_polygon, cap_lx, cap_ly) * (h_cap/1000.0) * 24.0,
+        "wcap_uls_factor": st.session_state.wcap_uls_factor,
+        "Pu_total_kN": results["Pu_total_kN"],
+        "anchorage_mode": anchorage_mode,
+        "anchorage_bottom_z": bottom_bar_z,
+        "anchorage_vertical_hook_avail": avail_vertical_hook,
+        "stm_model_type": results.get("stm_model_type", st.session_state.stm_model_type),
+        "D": D, "h_cap": h_cap, "col_size": col_size,
+        "coords": coords,
+        "cap_lx": cap_lx, "cap_ly": cap_ly,
+        "cap_cx": cap_cx, "cap_cy": cap_cy,
+        "cap_polygon": cap_polygon,
+        "shape_label": shape_label,
+        "spacing_factor_x": spacing_factor_x,
+        "spacing_factor_y": spacing_factor_y,
+        "clear_min": st.session_state.clear_min,
+    }
+    try:
+        docx_buf = generate_report(
+            inputs_dict, results, x_chk, y_chk, pairs,
+            anch_x=anch_x, anch_y=anch_y,
+            opt_x=opt_x, opt_y=opt_y,
+            top_rebar=top_rebar)
+        st.download_button(
+            "⬇️ Download Word Report (.docx)",
+            data=docx_buf,
+            file_name="pile_cap_design_report.docx",
+            mime=("application/vnd.openxmlformats-officedocument."
+                  "wordprocessingml.document"),
+            use_container_width=True, type="secondary")
+    except Exception as exc:
+        st.error("Report generation failed: {}".format(exc))
+else:
+    st.info("Set inputs in sidebar and click **Calculate STM**. "
+            "Layout preview & pile reactions update live.")
