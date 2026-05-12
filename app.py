@@ -1233,10 +1233,10 @@ if "_stm_results" in st.session_state:
         st.dataframe(pd.DataFrame(recs), use_container_width=True,
                      hide_index=True)
 
-    t1, t2, t6, t3, t7, t4, t5, t8 = st.tabs([
+    t1, t2, t6, t3, t7, t4, t8, t5 = st.tabs([
         "📊 Plan", "📈 Elevation", "🎲 3D View",
-        "🔩 Bottom Rebar", "🪟 Top Rebar",
-        "⚓ Anchorage", "📋 Detail", "🧱 Pile Forces"])
+        "🔩 Bottom", "🪟 Top",
+        "⚓ Anchor", "🧱 Pile Forces", "📋 Detail"])
 
     with t1:
         st.plotly_chart(
@@ -1828,6 +1828,19 @@ As_min,bottom = ρ_min × Ag
         ]
         ck = pd.concat([ck, pd.DataFrame(extra_checks)], ignore_index=True)
         st.dataframe(ck, use_container_width=True, hide_index=True)
+
+        with st.expander("Pile head forces summary", expanded=False):
+            pile_force_rows, pile_force_summary = _pile_head_force_rows(results)
+            if pile_force_summary:
+                st.markdown("#### Critical Pile Summary")
+                st.dataframe(
+                    pd.DataFrame(pile_force_summary),
+                    use_container_width=True, hide_index=True)
+            if pile_force_rows:
+                st.markdown("#### Forces by Pile")
+                st.dataframe(
+                    pd.DataFrame(pile_force_rows),
+                    use_container_width=True, hide_index=True)
 
     with t8:
         st.markdown("### Pile Head Forces Below Pile Cap")
