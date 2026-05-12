@@ -1572,7 +1572,7 @@ with st.sidebar:
         "load_cases": default_load_cases().to_dict(orient="records"),
     }
     payload = project_payload({key: st.session_state.get(key, value) for key, value in default_state.items()})
-    st.download_button("Download project JSON", payload, file_name="pile_rebar_design.json", mime="application/json", use_container_width=True)
+    st.download_button("Save Project", payload, file_name="pile_rebar_design.json", mime="application/json", use_container_width=True)
     uploaded = st.file_uploader("Open project JSON", type=["json"])
     if uploaded is not None:
         try:
