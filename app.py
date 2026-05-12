@@ -955,13 +955,13 @@ def section_figure(
         )
 
     fig.update_layout(
-        title="Base section reinforcement",
+        title={"text": "Section Reinforcement", "y": 0.97},
         template="plotly_white",
         height=520,
         xaxis={"title": "x (mm)", "scaleanchor": "y", "range": [-limit, limit]},
         yaxis={"title": "y (mm)", "range": [-limit, limit]},
         legend={"orientation": "h"},
-        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        margin={"l": 20, "r": 20, "t": 80, "b": 20},
     )
     if note_text:
         fig.add_annotation(
@@ -1043,11 +1043,11 @@ def interaction_plot_with_demand(df_x: pd.DataFrame, df_y: pd.DataFrame, pu_kN: 
     fig.update_layout(
         template="plotly_white",
         height=460,
-        title="Uniaxial interaction curves at base section",
+        title={"text": "Uniaxial Interaction Curves", "y": 0.97},
         xaxis_title="phi Mn (kN-m)",
         yaxis_title="phi Pn (kN)",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0.0},
-        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "x": 0.0},
+        margin={"l": 20, "r": 20, "t": 90, "b": 20},
     )
     return fig
 
